@@ -1,0 +1,190 @@
+[
+  {
+    "id": "1746b33d-3f0b-4f26-8f4c-62e6a8837810",
+    "status": "FINISHED",
+    "platform": "ANDROID",
+    "artifacts": {
+      "buildUrl": "https://expo.dev/artifacts/eas/G6okVutc0F-KSiYYEwN45XJHXAm3__Whx-6K9UVYtKI.aab",
+      "applicationArchiveUrl": "https://expo.dev/artifacts/eas/G6okVutc0F-KSiYYEwN45XJHXAm3__Whx-6K9UVYtKI.aab"
+    },
+    "fingerprint": {
+      "id": "019fcc2a-0311-7a3b-80f8-612b8c4e1fc4",
+      "hash": "3995397627c999311707e3868af5db59bfd330aa"
+    },
+    "initiatingActor": {
+      "id": "d8b637f7-40a4-4f1c-821f-0fc53a8c7682",
+      "displayName": "ditscompany"
+    },
+    "logFiles": [
+      "https://storage.googleapis.com/eas-workflows-production/logs/6e6270de-87cb-44cd-8709-e7da0fd06013/1746b33d-3f0b-4f26-8f4c-62e6a8837810/2026-08-04T10%3A10%3A00Z-fd233661-26d9-49c3-9711-d2ad79955502.txt?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=www-production%40exponentjs.iam.gserviceaccount.com%2F20260804%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260804T101043Z&X-Goog-Expires=900&X-Goog-SignedHeaders=host&X-Goog-Signature=995c3369bee2edfe088fc016d43320787f47fa0f70c0c6b59aad2435a06cb0d5ea2cfe17d49aa2eae35b9991d9a5c38882a2736703e1fef72f0220541edc1a4bb2c1e2937c7241ddbaa7bc4e756ea20c30a58c60e654a529be99fc422873b80181a40c66a5e7a250a901172b5d3841621d3c9eff334e6538ec2f0a03bd1f5a7fd7ba6caa048a2028c56a360a52b52faef8f38bf67407d5811ff06a5c5d9e4b0474af07cc3481e935d633d93af6b999248d98275292056a77da29c61d1882276f78f5e467f8b12efd2796303e2350679f79d2cb6adc502028bce9079a8653add2b6cce295e03f480bd37f3116cdca6cc183bc5c4a8b4b7fdb7baf340e4ad5c866"
+    ],
+    "project": {
+      "id": "6e6270de-87cb-44cd-8709-e7da0fd06013",
+      "name": "qralertgo",
+      "slug": "qralertgo",
+      "ownerAccount": {
+        "id": "fce1e284-465e-4a8c-b294-a73ab3061dce",
+        "name": "ditscompany"
+      }
+    },
+    "distribution": "STORE",
+    "buildProfile": "production",
+    "sdkVersion": "55.0.0",
+    "appVersion": "1.1.0",
+    "appBuildVersion": "6",
+    "gitCommitHash": "965a252b91d3a4f667ddec2f79f04cd86b82cfe6",
+    "gitCommitMessage": "close error done",
+    "priority": "NORMAL",
+    "createdAt": "2026-08-04T09:45:33.165Z",
+    "updatedAt": "2026-08-04T10:18:06.388Z",
+    "completedAt": "2026-08-04T10:18:06.231Z",
+    "expirationDate": "2026-09-03T09:45:33.194Z",
+    "isForIosSimulator": false,
+    "metrics": {
+      "buildWaitTime": 3941,
+      "buildQueueTime": 1468582,
+      "buildDuration": 480543
+    }
+  },
+  {
+    "id": "780d7bbd-012c-4c73-9d5d-d50ae1b0ecfc",
+    "status": "FINISHED",
+    "platform": "ANDROID",
+    "artifacts": {
+      "buildUrl": "https://expo.dev/artifacts/eas/5PUOoqyYMybqNFA2v8vQPugCK_fYzTGykD2boNoblOY.aab",
+      "applicationArchiveUrl": "https://expo.dev/artifacts/eas/5PUOoqyYMybqNFA2v8vQPugCK_fYzTGykD2boNoblOY.aab"
+    },
+    "fingerprint": {
+      "id": "019fcc1d-9cdf-709b-a0e1-7e2211b79798",
+      "hash": "0a42c377e7982cfbc2212311e5bfa3ee9b815aee"
+    },
+    "initiatingActor": {
+      "id": "d8b637f7-40a4-4f1c-821f-0fc53a8c7682",
+      "displayName": "ditscompany"
+    },
+    "logFiles": [
+      "https://storage.googleapis.com/eas-workflows-production/logs/6e6270de-87cb-44cd-8709-e7da0fd06013/780d7bbd-012c-4c73-9d5d-d50ae1b0ecfc/2026-08-04T09%3A54%3A24Z-bde8fb5b-7d3c-4e16-ab6a-ee286df661e8.txt?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=www-production%40exponentjs.iam.gserviceaccount.com%2F20260804%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260804T101043Z&X-Goog-Expires=900&X-Goog-SignedHeaders=host&X-Goog-Signature=c13dfe5cef69c6d6f5ba8da6d9e22189d3287caf80292e8d8ed850ee19beddf8133e1d9630c48934e7e7b1074593e0a92d42f15fd9dc2f802f5bce727ea2220d073d21d8a31b02cdf7062157394ce989bb94e299af473e8a2d0f8633f3918a6a68a871e4f9f277877fa3f5f415cc6d8e8c928322c7d36ef1cc3a6812d230bebd04f1e86a02b18dd8d0033d571fb612e62627235284c62f42af4a17a070e408b62bc6ca9810fe02b0ba90d5fbd83436f741ebc0adc71fcfce76fe42205a164f2096db09c9d5738623e40115175f0b1a2846837251061e6fcd4514e9c1a6337e975d0f21c7d61a5ca94046eb5a67e01b5662966926f64703daa45c75e66a82ae32"
+    ],
+    "project": {
+      "id": "6e6270de-87cb-44cd-8709-e7da0fd06013",
+      "name": "qralertgo",
+      "slug": "qralertgo",
+      "ownerAccount": {
+        "id": "fce1e284-465e-4a8c-b294-a73ab3061dce",
+        "name": "ditscompany"
+      }
+    },
+    "distribution": "STORE",
+    "buildProfile": "production",
+    "sdkVersion": "55.0.0",
+    "appVersion": "1.1.0",
+    "appBuildVersion": "6",
+    "gitCommitHash": "965a252b91d3a4f667ddec2f79f04cd86b82cfe6",
+    "gitCommitMessage": "close error done",
+    "priority": "NORMAL",
+    "createdAt": "2026-08-04T09:32:00.557Z",
+    "updatedAt": "2026-08-04T10:01:53.737Z",
+    "completedAt": "2026-08-04T10:01:53.562Z",
+    "expirationDate": "2026-09-03T09:32:00.595Z",
+    "isForIosSimulator": false,
+    "metrics": {
+      "buildWaitTime": 1638,
+      "buildQueueTime": 1346630,
+      "buildDuration": 444737
+    }
+  },
+  {
+    "id": "55bc45a2-87be-4f50-8e50-9011cfa55741",
+    "status": "FINISHED",
+    "platform": "ANDROID",
+    "artifacts": {
+      "buildUrl": "https://expo.dev/artifacts/eas/pfk8iiKJTbODJxYOoPy-oBfL3geQg-jwOHtt7egMPCo.apk",
+      "applicationArchiveUrl": "https://expo.dev/artifacts/eas/pfk8iiKJTbODJxYOoPy-oBfL3geQg-jwOHtt7egMPCo.apk"
+    },
+    "fingerprint": {
+      "id": "019fcbf2-91e0-7957-a8e3-5191e84fef8d",
+      "hash": "a99dc250568b009238a3d85de8a9c528c5d3f044"
+    },
+    "initiatingActor": {
+      "id": "d8b637f7-40a4-4f1c-821f-0fc53a8c7682",
+      "displayName": "ditscompany"
+    },
+    "logFiles": [
+      "https://storage.googleapis.com/eas-workflows-production/logs/6e6270de-87cb-44cd-8709-e7da0fd06013/55bc45a2-87be-4f50-8e50-9011cfa55741/2026-08-04T08%3A55%3A06Z-22c08279-fb61-4eec-8c13-80b5ee36f163.txt?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=www-production%40exponentjs.iam.gserviceaccount.com%2F20260804%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260804T101043Z&X-Goog-Expires=900&X-Goog-SignedHeaders=host&X-Goog-Signature=829a8351de639baa6ad8bb58f8c8c9b9cb58837f64463777083d0df9056ad393adc92c677d80cf1596c11685dfe0a289b73f5c7c2747913f78c6f4c008e324c366088d1f0f47599ad8fb775253ba31db2e48329e0faef1cfcf2f85f8fc822b9ef200a186e8885a4b5f2672323b63f3224648775de5296a83000a2659ea6e2672a967a05a549bbb696fef5f82e97f92b03951e015da2e5b24b1cb94b45356515090c79a8af4dbb672959397b938a7fa48be46c822abb460e926314947b7e1bb7c9714dd7472221f3335cdd7e1bab846da3b0bbc3478ba1801afa8ff8b9474f5fd179ce967f7ba5cc3c1193b929f4f9dbf9f89c8d65e1580f0551f165546515104"
+    ],
+    "project": {
+      "id": "6e6270de-87cb-44cd-8709-e7da0fd06013",
+      "name": "qralertgo",
+      "slug": "qralertgo",
+      "ownerAccount": {
+        "id": "fce1e284-465e-4a8c-b294-a73ab3061dce",
+        "name": "ditscompany"
+      }
+    },
+    "distribution": "INTERNAL",
+    "buildProfile": "preview",
+    "sdkVersion": "55.0.0",
+    "appVersion": "1.1.0",
+    "appBuildVersion": "5",
+    "gitCommitHash": "868c1fdd9da4c53bf6e9d617e63ff9ab405c4085",
+    "gitCommitMessage": "change update",
+    "priority": "NORMAL",
+    "createdAt": "2026-08-04T08:44:59.484Z",
+    "updatedAt": "2026-08-04T09:02:43.680Z",
+    "completedAt": "2026-08-04T09:02:43.521Z",
+    "expirationDate": "2026-08-18T08:44:59.734Z",
+    "isForIosSimulator": false,
+    "metrics": {
+      "buildWaitTime": 2660,
+      "buildQueueTime": 609116,
+      "buildDuration": 452261
+    }
+  },
+  {
+    "id": "be409aad-189f-41bf-913b-645ea751ec34",
+    "status": "FINISHED",
+    "platform": "ANDROID",
+    "artifacts": {
+      "buildUrl": "https://expo.dev/artifacts/eas/zk65-JwNE7Z0mkwyEktYcjD8flawJ_dtxtXvbIKTqKI.apk",
+      "applicationArchiveUrl": "https://expo.dev/artifacts/eas/zk65-JwNE7Z0mkwyEktYcjD8flawJ_dtxtXvbIKTqKI.apk"
+    },
+    "fingerprint": {
+      "id": "019fcbb3-1bb9-73fc-a4aa-a558017ba150",
+      "hash": "26eba3746462ff9c713b39400fd333bd54594750"
+    },
+    "initiatingActor": {
+      "id": "d8b637f7-40a4-4f1c-821f-0fc53a8c7682",
+      "displayName": "ditscompany"
+    },
+    "logFiles": [
+      "https://storage.googleapis.com/eas-workflows-production/logs/6e6270de-87cb-44cd-8709-e7da0fd06013/be409aad-189f-41bf-913b-645ea751ec34/2026-08-04T07%3A38%3A11Z-a94a39e9-6bba-4e04-8669-a8553de875dc.txt?X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Credential=www-production%40exponentjs.iam.gserviceaccount.com%2F20260804%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20260804T101043Z&X-Goog-Expires=900&X-Goog-SignedHeaders=host&X-Goog-Signature=4e8cf9a1498eb41fa6e01e948fe084c33a07232a345829f1a512109640150189d680625f7839588199eed42d0d91ac4b14efabde72b9b5ecbce8a9299589c8562af1805af7c50d6341ab10aebefe8e44bd2fe1be2fda1d2ff73d58515f782f324586627bf278aea745fcc3e58a18adb2bd630e26d546dd8822b8555cb9d82a30f8fb6f70eba07ec136c61038bc3628cbc5607d012f361ccdad461bd37c82ffd5ed20308d628bcc23cc687e57c097c7be97302d30f77fdd128fc793df5ee5089345e0da2c0e0f75e859fcbc77550f31540a3f72e1c2b62960db79f3529d26f8cc4f0fcc020206aaea60c76eaf4af699eae9ab18e3e770a4fa6edad813bdc35211"
+    ],
+    "project": {
+      "id": "6e6270de-87cb-44cd-8709-e7da0fd06013",
+      "name": "qralertgo",
+      "slug": "qralertgo",
+      "ownerAccount": {
+        "id": "fce1e284-465e-4a8c-b294-a73ab3061dce",
+        "name": "ditscompany"
+      }
+    },
+    "distribution": "INTERNAL",
+    "buildProfile": "preview",
+    "sdkVersion": "55.0.0",
+    "appVersion": "1.1.0",
+    "appBuildVersion": "5",
+    "gitCommitHash": "fae452dc22742f25cd3988009c0e7d5596e24880",
+    "gitCommitMessage": "Fix launcher icons, bump versionCode to 5, correct adaptive icon safe zone",
+    "priority": "NORMAL",
+    "createdAt": "2026-08-04T07:35:40.700Z",
+    "updatedAt": "2026-08-04T07:46:13.346Z",
+    "completedAt": "2026-08-04T07:46:13.196Z",
+    "expirationDate": "2026-08-18T07:35:40.719Z",
+    "isForIosSimulator": false,
+    "metrics": {
+      "buildWaitTime": 2796,
+      "buildQueueTime": 152122,
+      "buildDuration": 477578
+    }
+  }
+]

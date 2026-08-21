@@ -1,0 +1,318 @@
+const { applicationDefault, cert, getApp, getApps, initializeApp } = require('firebase-admin/app');
+const { getMessaging } = require('firebase-admin/messaging');
+const { pool } = require('../config/database');
+
+let fcmTokenColumnChecked = false;
+
+const normalizePushToken = (token) => (typeof token === 'string' ? token.trim() : '');
+
+const parseServiceAccount = () => {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey =
+    process.env.FIREBASE_PRIVATE_KEY_BASE64
+      ? Buffer.from(process.env.FIREBASE_PRIVATE_KEY_BASE64, 'base64').toString('utf8')
+      : process.env.FIREBASE_PRIVATE_KEY?.replace(/\\\n/g, '\n').replace(/\\n/g, '\n');
+
+  if (projectId && clientEmail && privateKey) {
+    return {
+      project_id: projectId,
+      client_email: clientEmail,
+      private_key: privateKey,
+    };
+  }
+
+  return null;
+};
+
+const getFirebaseApp = () => {
+  if (getApps().length > 0) return getApp();
+
+  const serviceAccount = parseServiceAccount();
+  if (serviceAccount) {
+    return initializeApp({
+      credential: cert(serviceAccount),
+      projectId: serviceAccount.project_id || process.env.FIREBASE_PROJECT_ID,
+    });
+  }
+
+  return initializeApp({
+    credential: applicationDefault(),
+    projectId: process.env.FIREBASE_PROJECT_ID,
+  });
+};
+
+const ensureFcmTokenColumn = async () => {
+  if (fcmTokenColumnChecked) return;
+
+  const [columns] = await pool.execute(
+    `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'users'
+        AND COLUMN_NAME = 'fcm_token'`
+  );
+
+  if (columns.length === 0) {
+    await pool.execute(
+      'ALTER TABLE users ADD COLUMN fcm_token TEXT NULL AFTER can_hide_number'
+    );
+    await pool.execute(
+      'CREATE INDEX idx_fcm_token ON users (fcm_token(191))'
+    ).catch(() => {});
+  }
+
+  fcmTokenColumnChecked = true;
+};
+
+const saveUserPushToken = async (userId, token) => {
+  await ensureFcmTokenColumn();
+  const fcmToken = normalizePushToken(token);
+
+  if (!fcmToken) {
+    throw new Error('FCM token is required');
+  }
+
+  await pool.execute(
+    'UPDATE users SET fcm_token = ? WHERE id = ?',
+    [fcmToken, userId]
+  );
+
+  return fcmToken;
+};
+
+const getUserPushToken = async (userId) => {
+  await ensureFcmTokenColumn();
+  const [rows] = await pool.execute(
+    'SELECT fcm_token FROM users WHERE id = ?',
+    [userId]
+  );
+
+  return rows[0]?.fcm_token || null;
+};
+
+const clearUserPushToken = async (userId) => {
+  await ensureFcmTokenColumn();
+  await pool.execute(
+    'UPDATE users SET fcm_token = NULL WHERE id = ?',
+    [userId]
+  );
+};
+
+const sendFcmMessage = async ({ token, title, body, data = {}, channelId, tag, ongoing, actions }) => {
+  const fcmToken = normalizePushToken(token);
+  if (!fcmToken) {
+    return { sent: false, reason: 'Missing FCM token' };
+  }
+
+  try {
+    const app = getFirebaseApp();
+    const stringData = Object.fromEntries(
+      Object.entries({
+        title,
+        body,
+        channel_id: channelId,
+        ...data,
+      }).map(([key, value]) => [key, value == null ? '' : String(value)])
+    );
+
+    const message = {
+      token: fcmToken,
+      data: stringData,
+      android: {
+        priority: 'high',
+        ttl: 864000,
+        notification: {
+          channelId: channelId || 'default',
+          priority: 'max',
+          sound: 'ringtone',
+          defaultSound: false,
+          visibility: 'public',
+          ...(tag ? { tag: String(tag).slice(0, 64) } : {}),
+        },
+      },
+      apns: {
+        headers: {
+          'apns-priority': '10',
+          'apns-expiration': '864000',
+        },
+        payload: {
+          aps: {
+            alert: { title, body },
+            sound: 'ringtone.caf',
+            contentAvailable: true,
+            mutableContent: true,
+            category: channelId === 'incoming-calls' ? 'incoming_call' : 'incoming_alert',
+          },
+        },
+      },
+    };
+
+    const messageId = await getMessaging(app).send(message);
+
+    return { sent: true, messageId };
+  } catch (error) {
+    console.error('FCM send failed:', error);
+    return { sent: false, reason: error.message };
+  }
+};
+
+const sendIncomingCallPush = async ({
+  fcmToken,
+  callerName,
+  qrCodeId,
+  callId,
+  scannerSocketId,
+  scannerUserId,
+  ownerUserId,
+  isReminder = false,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Incoming app call',
+    body: `${callerName || 'Someone'} is calling about your vehicle.`,
+    channelId: 'incoming-calls',
+    tag: callId,
+    ongoing: true,
+    actions: [{ title: 'Stop' }],
+    data: {
+      type: 'incoming_call',
+      call_id: callId,
+      qr_code_id: qrCodeId,
+      caller_socket_id: scannerSocketId || '',
+      caller_user_id: scannerUserId || '',
+      scanner_socket_id: scannerSocketId || '',
+      scanner_user_id: scannerUserId || '',
+      owner_user_id: ownerUserId || '',
+      caller_name: callerName || 'Someone',
+      sent_at: new Date().toISOString(),
+      timeout_ms: process.env.INCOMING_RING_TIMEOUT_MS || process.env.MISSED_CALL_TIMEOUT_MS || 300000,
+      is_reminder: isReminder ? 'true' : '',
+    },
+  });
+
+const sendMissedCallPush = async ({
+  fcmToken,
+  callerName,
+  qrCodeId,
+  callId,
+  scannerUserId,
+  ownerUserId,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Missed app call',
+    body: `You missed a vehicle call from ${callerName || 'someone'}.`,
+    channelId: 'missed-calls',
+    data: {
+      type: 'missed_call',
+      call_id: callId,
+      qr_code_id: qrCodeId,
+      scanner_user_id: scannerUserId || '',
+      owner_user_id: ownerUserId || '',
+      caller_name: callerName || 'Someone',
+    },
+  });
+
+const sendIncomingAlertPush = async ({
+  fcmToken,
+  qrCodeId,
+  requestId,
+  scannerSocketId,
+  scannerUserId,
+  scannerPhone,
+  message,
+  isReminder = false,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Vehicle alert',
+    body: message || 'Someone is trying to contact you about your vehicle.',
+    channelId: 'vehicle-alerts',
+    tag: requestId,
+    ongoing: true,
+    actions: [{ title: 'Stop' }],
+    data: {
+      type: 'incoming_alert',
+      request_id: requestId,
+      qr_code_id: qrCodeId,
+      scanner_socket_id: scannerSocketId || '',
+      scanner_user_id: scannerUserId || '',
+      scanner_phone: scannerPhone || '',
+      message: message || 'Someone is trying to contact you about your vehicle.',
+      sent_at: new Date().toISOString(),
+      timeout_ms: process.env.INCOMING_ALERT_RING_MS || 30000,
+      is_reminder: isReminder ? 'true' : '',
+    },
+  });
+
+const sendCancelCallPush = async ({
+  fcmToken,
+  callId,
+  ownerUserId,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Call cancelled',
+    body: 'The caller cancelled the call request.',
+    channelId: 'missed-calls',
+    data: {
+      type: 'cancel_call',
+      call_id: callId || '',
+      owner_user_id: ownerUserId || '',
+    },
+  });
+
+const reminderIntervals = new Map();
+
+const scheduleCallReminders = ({ callId, fcmToken, callerName, qrCodeId, scannerSocketId, scannerUserId, ownerUserId, requestId, scannerPhone, message, type = 'call' }) => {
+  const key = callId || requestId;
+  if (!key || !fcmToken) return;
+
+  const isAlert = type === 'alert';
+  const intervalMs = Number(process.env[isAlert ? 'INCOMING_ALERT_RING_REMINDER_MS' : 'INCOMING_RING_REMINDER_MS']) || (isAlert ? 10000 : 15000);
+  const maxDurationMs = Number(process.env[isAlert ? 'INCOMING_ALERT_RING_MS' : 'INCOMING_RING_TIMEOUT_MS']) || (isAlert ? 30000 : 300000);
+  let elapsed = 0;
+
+  const interval = setInterval(async () => {
+    elapsed += intervalMs;
+    if (elapsed >= maxDurationMs) {
+      clearInterval(interval);
+      reminderIntervals.delete(key);
+      return;
+    }
+
+    if (isAlert) {
+      await sendIncomingAlertPush({ fcmToken, qrCodeId, requestId, scannerSocketId, scannerUserId, scannerPhone, message, isReminder: true });
+    } else {
+      await sendIncomingCallPush({ fcmToken, callerName, qrCodeId, callId, scannerSocketId, scannerUserId, ownerUserId, isReminder: true });
+    }
+  }, intervalMs);
+
+  reminderIntervals.set(key, interval);
+};
+
+const stopCallReminders = (key) => {
+  const interval = reminderIntervals.get(key);
+  if (interval) {
+    clearInterval(interval);
+    reminderIntervals.delete(key);
+  }
+};
+
+module.exports = {
+  ensureFcmTokenColumn,
+  saveUserPushToken,
+  getUserPushToken,
+  clearUserPushToken,
+  sendIncomingCallPush,
+  sendIncomingAlertPush,
+  sendMissedCallPush,
+  sendCancelCallPush,
+  scheduleCallReminders,
+  stopCallReminders,
+};

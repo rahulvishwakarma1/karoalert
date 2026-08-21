@@ -1,0 +1,1082 @@
+const express = require('express');
+const cors    = require('cors');
+const helmet  = require('helmet');
+const rateLimit = require('express-rate-limit');
+const path    = require('path');
+const http    = require('http');
+const crypto  = require('crypto');
+const { Server } = require('socket.io');
+const twilio  = require('twilio');
+
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+if (!process.env.JWT_SECRET) {
+  process.env.JWT_SECRET = 'mySuperSecretKey123';
+}
+console.log('JWT_SECRET loaded:', process.env.JWT_SECRET ? '✅' : '❌');
+
+const authRoutes     = require('./routes/auth');
+const vehicleRoutes  = require('./routes/vehicles');
+const qrRoutes       = require('./routes/qr');
+const scanRoutes     = require('./routes/scan');
+const adminRoutes    = require('./routes/admin');
+const paymentRoutes  = require('./routes/payments');
+const communicationSettingsRoutes = require('./routes/communication-settings');
+const privateCallRoutes = require('./routes/private-call');
+const { pool } = require('./config/database');
+const notificationService = require('./services/notificationService');
+const pushService = require('./services/pushService');
+
+const app = express();
+app.set('trust proxy', 'loopback');
+const server = http.createServer(app);
+
+// ─────────────────────────────────────────────────────────────────────────
+// Socket.IO server — production tuning for stable mobile connections
+// ─────────────────────────────────────────────────────────────────────────
+const io = new Server(server, {
+  cors: { origin: '*' },
+  pingInterval: 20000,
+  pingTimeout: 30000,
+  maxHttpBufferSize: 2e6,
+});
+
+// ── Signaling state ─────────────────────────────────────────────────────
+// connectedUsers : userId(String) -> primary socketId   (kept for legacy API routes)
+// userSockets    : userId(String) -> Set<socketId>      (every device of a user)
+// socketOwners   : socketId -> userId(String)
+// pendingCalls   : callId -> legacy push/ring call state (used by /api/scan routes)
+// activeCalls    : callId -> live app-to-app call state (socket signaling)
+const connectedUsers = new Map();
+const userSockets = new Map();
+const socketOwners = new Map();
+const pendingCalls = new Map();
+const activeCalls = new Map();
+const activeDeductions = new Map();
+
+const CALL_RESPONSE_TIMEOUT_MS = Number(process.env.CALL_RESPONSE_TIMEOUT_MS) || 30000;
+const SOCKET_SWEEP_INTERVAL_MS = Number(process.env.SOCKET_SWEEP_INTERVAL_MS) || 10000;
+
+app.set('io', io);
+app.set('connectedUsers', connectedUsers);
+app.set('userSockets', userSockets);
+app.set('pendingCalls', pendingCalls);
+app.set('activeDeductions', activeDeductions);
+
+// ── Signaling helpers ────────────────────────────────────────────────────
+const nowIso = () => new Date().toISOString();
+
+const log = (tag, message, extra = {}) => {
+  console.log(
+    `[SIGNAL] ${nowIso()} [${tag}] ${message}${Object.keys(extra).length ? ' ' + JSON.stringify(extra) : ''}`
+  );
+};
+
+const isSocketAlive = (socketId) => !!socketId && io.sockets.sockets.has(socketId);
+
+const safeEmit = (socketId, event, payload) => {
+  if (!isSocketAlive(socketId)) return false;
+  try {
+    io.to(socketId).emit(event, payload);
+    return true;
+  } catch (error) {
+    log('EMIT-ERROR', `Failed to emit ${event} to ${socketId}`, { error: error.message });
+    return false;
+  }
+};
+
+const ackOk = (ack, data = {}) => {
+  if (typeof ack === 'function') {
+    try { ack({ ok: true, ...data }); } catch (_) {}
+  }
+};
+
+const ackErr = (ack, error, data = {}) => {
+  if (typeof ack === 'function') {
+    try { ack({ ok: false, error, ...data }); } catch (_) {}
+  }
+};
+
+const registerUserSocket = (userId, socketId) => {
+  const key = String(userId);
+  if (!key) return false;
+
+  // If this socket previously belonged to a different user (re-login), clean it up
+  const prevUser = socketOwners.get(socketId);
+  if (prevUser && prevUser !== key) {
+    const prevSet = userSockets.get(prevUser);
+    if (prevSet) {
+      prevSet.delete(socketId);
+      if (prevSet.size === 0) userSockets.delete(prevUser);
+    }
+    if (connectedUsers.get(prevUser) === socketId) {
+      const fallback = prevSet && prevSet.size ? [...prevSet][0] : null;
+      if (fallback) connectedUsers.set(prevUser, fallback);
+      else connectedUsers.delete(prevUser);
+    }
+  }
+
+  socketOwners.set(socketId, key);
+  if (!userSockets.has(key)) userSockets.set(key, new Set());
+  userSockets.get(key).add(socketId);
+  connectedUsers.set(key, socketId); // most recently registered socket becomes primary
+  return true;
+};
+
+const unregisterSocket = (socketId) => {
+  const userId = socketOwners.get(socketId);
+  socketOwners.delete(socketId);
+  if (!userId) return null;
+
+  const set = userSockets.get(userId);
+  if (set) {
+    set.delete(socketId);
+    if (set.size === 0) {
+      userSockets.delete(userId);
+      connectedUsers.delete(userId);
+    } else if (connectedUsers.get(userId) === socketId) {
+      connectedUsers.set(userId, [...set][0]);
+    }
+  } else {
+    connectedUsers.delete(userId);
+  }
+  return userId;
+};
+
+const getSocketIdsForUser = (userId) => {
+  const set = userSockets.get(String(userId));
+  return set ? [...set] : [];
+};
+
+const resolveTarget = (data = {}, eventName) => {
+  if (data && data.target_socket_id) {
+    const sid = String(data.target_socket_id);
+    if (!isSocketAlive(sid)) {
+      return { error: 'TARGET_OFFLINE', message: 'Target socket is no longer connected' };
+    }
+    return { socketId: sid };
+  }
+  if (data && data.target_user_id !== undefined && data.target_user_id !== null) {
+    const ids = getSocketIdsForUser(data.target_user_id);
+    if (ids.length === 0) {
+      return { error: 'TARGET_OFFLINE', message: 'Target user is offline or not connected' };
+    }
+    let socketId = connectedUsers.get(String(data.target_user_id));
+    if (!socketId || !isSocketAlive(socketId)) socketId = ids[0];
+    return { socketId };
+  }
+  return { error: 'TARGET_NOT_SPECIFIED', message: `${eventName} requires target_socket_id or target_user_id` };
+};
+
+const clearPendingCall = (callId) => {
+  const pc = pendingCalls.get(callId);
+  if (!pc) return;
+  if (pc.timeoutId) clearTimeout(pc.timeoutId);
+  pendingCalls.delete(callId);
+};
+
+const cleanupActiveCall = (callId, reason = 'ended') => {
+  const call = activeCalls.get(callId);
+  if (!call) return null;
+  if (call.timeoutId) clearTimeout(call.timeoutId);
+  activeCalls.delete(callId);
+  log('CALL-CLEANUP', `Call ${callId} state removed`, { reason, status: call.status });
+  return call;
+};
+
+// Timeout a ringing call when the receiver did not respond within 30s
+const timeoutCall = (callId) => {
+  const call = activeCalls.get(callId);
+  if (!call) return;
+  if (call.status !== 'ringing') return;
+  clearTimeout(call.timeoutId);
+  call.timeoutId = null;
+  call.status = 'missed';
+  activeCalls.delete(callId);
+  clearPendingCall(callId);
+  log('CALL-TIMEOUT', `Call ${callId} timed out after ${CALL_RESPONSE_TIMEOUT_MS}ms`, {
+    caller_socket_id: call.callerSocketId,
+    target_socket_id: call.targetSocketId,
+  });
+
+  // New protocol events
+  safeEmit(call.callerSocketId, 'call-timeout', {
+    call_id: callId,
+    reason: 'timeout',
+    message: 'Receiver did not answer within 30 seconds',
+  });
+  safeEmit(call.callerSocketId, 'call-ended', { call_id: callId, reason: 'timeout' });
+  safeEmit(call.targetSocketId, 'call-ended', { call_id: callId, reason: 'timeout' });
+
+  // Legacy frontend events (VoiceCallContext waits for call_response 'missed')
+  safeEmit(call.callerSocketId, 'call_response', {
+    call_id: callId,
+    caller_socket_id: call.callerSocketId,
+    caller_user_id: call.callerUserId || null,
+    response: 'missed',
+    message: 'Owner did not answer the app call.',
+  });
+  safeEmit(call.targetSocketId, 'voice_call_end', { call_id: callId, reason: 'timeout' });
+
+  // Notify the receiver with a missed-call push so they can call back
+  if (call.targetUserId) {
+    pushService
+      .getUserPushToken(call.targetUserId)
+      .then((token) => {
+        if (!token) return;
+        return pushService.sendMissedCallPush({
+          fcmToken: token,
+          callerName: call.callerName || 'Someone',
+          qrCodeId: call.qrCodeId || null,
+          callId,
+          scannerUserId: call.callerUserId || null,
+          ownerUserId: call.targetUserId,
+        });
+      })
+      .catch((error) => log('CALL-TIMEOUT', 'Missed call push failed', { error: error.message }));
+  }
+};
+
+// Track calls delivered through the legacy /api/scan/call route so they get a
+// 30s server-side timeout and full cleanup (route code stays unchanged).
+const trackIncomingCall = (socketId, payload = {}) => {
+  const callId = payload.call_id;
+  if (!callId) return;
+  if (activeCalls.has(callId)) return;
+  if (!isSocketAlive(socketId)) return;
+
+  const callerSocketId = payload.caller_socket_id || payload.scanner_socket_id || null;
+  if (!callerSocketId) return;
+  const targetUserId = String(payload.owner_user_id || '');
+
+  // Duplicate prevention: don't stack a second ring for the same caller+receiver pair
+  for (const [cid, c] of activeCalls.entries()) {
+    if (c.status === 'ringing' && c.callerSocketId === callerSocketId && c.targetSocketId === socketId) {
+      return;
+    }
+  }
+
+  const call = {
+    callId,
+    qrCodeId: payload.qr_code_id || null,
+    callerSocketId,
+    callerUserId: payload.caller_user_id || payload.scanner_user_id || null,
+    callerName: payload.caller_name || 'Someone',
+    targetUserId,
+    targetSocketId: socketId,
+    status: 'ringing',
+    createdAt: nowIso(),
+    timeoutId: null,
+  };
+  call.timeoutId = setTimeout(() => timeoutCall(callId), CALL_RESPONSE_TIMEOUT_MS);
+  activeCalls.set(callId, call);
+  log('CALL-INITIATE', `Incoming call ${callId} tracked for user ${targetUserId}`, {
+    caller_socket_id: callerSocketId,
+    target_socket_id: socketId,
+    timeout_ms: CALL_RESPONSE_TIMEOUT_MS,
+  });
+};
+
+// ── Periodic sweep: remove stale socket mappings & dead call state ──────
+setInterval(() => {
+  try {
+    for (const [userId, socketId] of [...connectedUsers.entries()]) {
+      if (!isSocketAlive(socketId)) {
+        connectedUsers.delete(userId);
+        log('SWEEP', `Removed stale primary socket for user ${userId}`, { socket_id: socketId });
+      }
+    }
+    for (const [userId, set] of [...userSockets.entries()]) {
+      for (const sid of [...set]) {
+        if (!isSocketAlive(sid)) {
+          set.delete(sid);
+          socketOwners.delete(sid);
+          log('SWEEP', `Removed stale socket ${sid} for user ${userId}`);
+        }
+      }
+      if (set.size === 0) {
+        userSockets.delete(userId);
+      } else if (!connectedUsers.get(userId) || !isSocketAlive(connectedUsers.get(userId))) {
+        connectedUsers.set(userId, [...set][0]);
+      }
+    }
+    for (const [callId, call] of [...activeCalls.entries()]) {
+      if (call.status !== 'ringing') continue;
+      if (!isSocketAlive(call.targetSocketId)) {
+        timeoutCall(callId);
+      } else if (!isSocketAlive(call.callerSocketId)) {
+        cleanupActiveCall(callId, 'caller-gone');
+        clearPendingCall(callId);
+      }
+    }
+  } catch (error) {
+    log('SWEEP-ERROR', 'Socket sweep failed', { error: error.message });
+  }
+}, SOCKET_SWEEP_INTERVAL_MS);
+
+io.on('connection', (socket) => {
+  log('CONNECT', 'Client connected', { socket_id: socket.id });
+
+  // ── Registration ──────────────────────────────────────────────────────
+  // New protocol
+  socket.on('register-user', (data = {}, ack) => {
+    const userId = data?.user_id ?? data?.userId ?? null;
+    if (userId === null || userId === undefined || String(userId).trim() === '') {
+      log('REGISTER-FAILED', 'register-user missing user_id', { socket_id: socket.id });
+      ackErr(ack, 'INVALID_PAYLOAD', { message: 'user_id is required' });
+      return;
+    }
+    registerUserSocket(String(userId), socket.id);
+    log('REGISTER', `User ${userId} registered`, { socket_id: socket.id, device_id: data?.device_id || null });
+    ackOk(ack, { socket_id: socket.id, user_id: String(userId) });
+  });
+
+  // Legacy protocol (current app)
+  socket.on('register', (userId, ack) => {
+    const id = String(userId ?? '');
+    if (!id.trim()) {
+      log('REGISTER-FAILED', 'register missing userId', { socket_id: socket.id });
+      ackErr(ack, 'INVALID_PAYLOAD', { message: 'userId is required' });
+      return;
+    }
+    registerUserSocket(id, socket.id);
+    log('REGISTER', `User ${id} registered`, { socket_id: socket.id });
+    ackOk(ack, { socket_id: socket.id, user_id: id });
+  });
+
+  // ── New protocol: initiate a call ─────────────────────────────────────
+  socket.on('call-user', (data = {}, ack) => {
+    try {
+      const callerSocketId = socket.id;
+      const callerUserId = socketOwners.get(callerSocketId) || data.caller_user_id || null;
+      if (!callerUserId) {
+        ackErr(ack, 'SOCKET_NOT_REGISTERED', { message: 'Register your user before initiating a call' });
+        return;
+      }
+      const targetUserId = data.target_user_id;
+      if (targetUserId === undefined || targetUserId === null) {
+        ackErr(ack, 'TARGET_NOT_SPECIFIED', { message: 'target_user_id is required' });
+        return;
+      }
+      if (String(targetUserId) === String(callerUserId)) {
+        ackErr(ack, 'SELF_CALL', { message: 'You cannot call yourself' });
+        return;
+      }
+      const targetSocketIds = getSocketIdsForUser(targetUserId);
+      if (targetSocketIds.length === 0) {
+        log('CALL-BLOCKED', `Call to user ${targetUserId} blocked — target offline`, { caller_socket_id: callerSocketId });
+        ackErr(ack, 'TARGET_OFFLINE', { message: 'Target user is offline or not connected' });
+        return;
+      }
+
+      // Duplicate call prevention: one active call per user at a time
+      for (const [cid, c] of activeCalls.entries()) {
+        const involves = c.callerSocketId === callerSocketId || c.targetSocketId === callerSocketId;
+        if (involves && c.status !== 'ended') {
+          ackErr(ack, 'DUPLICATE_CALL', { message: 'You already have an active call', call_id: cid });
+          return;
+        }
+      }
+
+      const callId = data.call_id || `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+      const call = {
+        callId,
+        qrCodeId: data.qr_code_id || null,
+        callerSocketId,
+        callerUserId,
+        callerName: data.caller_name || 'Someone',
+        targetUserId: String(targetUserId),
+        targetSocketId: targetSocketIds[0],
+        status: 'ringing',
+        createdAt: nowIso(),
+        timeoutId: null,
+      };
+      call.timeoutId = setTimeout(() => timeoutCall(callId), CALL_RESPONSE_TIMEOUT_MS);
+      activeCalls.set(callId, call);
+
+      const payload = {
+        call_id: callId,
+        qr_code_id: data.qr_code_id || null,
+        caller_socket_id: callerSocketId,
+        caller_user_id: callerUserId,
+        caller_name: data.caller_name || 'Someone',
+        owner_user_id: String(targetUserId),
+        sent_at: nowIso(),
+        message: 'Incoming app call',
+      };
+      for (const sid of targetSocketIds) {
+        safeEmit(sid, 'incoming-call', payload);
+      }
+      safeEmit(targetSocketIds[0], 'incoming_call', payload); // legacy alias
+
+      log('CALL-INITIATE', `Call ${callId} initiated by user ${callerUserId} -> user ${targetUserId}`, {
+        caller_socket_id: callerSocketId,
+        target_socket_ids: targetSocketIds,
+        timeout_ms: CALL_RESPONSE_TIMEOUT_MS,
+      });
+      ackOk(ack, { call_id: callId, target_socket_id: targetSocketIds[0] });
+    } catch (err) {
+      log('CALL-ERROR', 'call-user failed', { error: err.message });
+      ackErr(ack, 'INTERNAL_ERROR', { message: err.message });
+    }
+  });
+
+  // ── New protocol: accept a call ───────────────────────────────────────
+  socket.on('accept-call', (data = {}, ack) => {
+    try {
+      const callId = data?.call_id;
+      const call = callId ? activeCalls.get(callId) : null;
+      if (!call) {
+        ackErr(ack, 'CALL_NOT_FOUND', { message: 'Call does not exist or has already ended' });
+        return;
+      }
+      if (call.status !== 'ringing') {
+        ackErr(ack, 'CALL_NOT_RINGING', { message: 'Call is no longer ringing', status: call.status });
+        return;
+      }
+      if (!getSocketIdsForUser(call.targetUserId).includes(socket.id)) {
+        ackErr(ack, 'NOT_RECIPIENT', { message: 'You are not the recipient of this call' });
+        return;
+      }
+      if (call.timeoutId) clearTimeout(call.timeoutId);
+      call.timeoutId = null;
+      call.status = 'connected';
+      call.targetSocketId = socket.id;
+      clearPendingCall(callId);
+
+      const acceptedPayload = {
+        call_id: callId,
+        caller_socket_id: call.callerSocketId,
+        caller_user_id: call.callerUserId || null,
+        receiver_socket_id: socket.id,
+        receiver_user_id: call.targetUserId,
+        response: 'accepted',
+      };
+      safeEmit(call.callerSocketId, 'call-accepted', acceptedPayload);
+      safeEmit(call.callerSocketId, 'call_response', acceptedPayload); // legacy alias
+
+      log('CALL-ACCEPTED', `Call ${callId} accepted by ${socket.id}`, { caller_socket_id: call.callerSocketId });
+      ackOk(ack, { caller_socket_id: call.callerSocketId });
+    } catch (err) {
+      log('CALL-ERROR', 'accept-call failed', { error: err.message });
+      ackErr(ack, 'INTERNAL_ERROR', { message: err.message });
+    }
+  });
+
+  // ── New protocol: reject a call ───────────────────────────────────────
+  socket.on('reject-call', (data = {}, ack) => {
+    try {
+      const callId = data?.call_id;
+      const call = callId ? activeCalls.get(callId) : null;
+      if (!call) {
+        ackErr(ack, 'CALL_NOT_FOUND', { message: 'Call does not exist or has already ended' });
+        return;
+      }
+      if (!getSocketIdsForUser(call.targetUserId).includes(socket.id)) {
+        ackErr(ack, 'NOT_RECIPIENT', { message: 'You are not the recipient of this call' });
+        return;
+      }
+      clearPendingCall(callId);
+      cleanupActiveCall(callId, 'rejected');
+
+      safeEmit(call.callerSocketId, 'call-rejected', { call_id: callId, reason: data?.reason || 'rejected' });
+      safeEmit(call.callerSocketId, 'call_response', {
+        call_id: callId,
+        caller_socket_id: call.callerSocketId,
+        caller_user_id: call.callerUserId || null,
+        receiver_socket_id: socket.id,
+        response: 'rejected',
+        message: data?.reason || 'Owner rejected your app call.',
+      }); // legacy alias
+
+      log('CALL-REJECTED', `Call ${callId} rejected by ${socket.id}`);
+      ackOk(ack, {});
+    } catch (err) {
+      log('CALL-ERROR', 'reject-call failed', { error: err.message });
+      ackErr(ack, 'INTERNAL_ERROR', { message: err.message });
+    }
+  });
+
+  // ── Legacy protocol: call response (accept / reject / missed) ─────────
+  socket.on('call_response', (data = {}) => {
+    const callId = data?.call_id;
+    const response = data?.response;
+
+    if (callId) {
+      pushService.stopCallReminders(callId);
+      const active = activeCalls.get(callId);
+      if (active) {
+        if (response === 'accepted') {
+          if (active.timeoutId) clearTimeout(active.timeoutId);
+          active.timeoutId = null;
+          active.status = 'connected';
+          if (data.receiver_socket_id) active.targetSocketId = data.receiver_socket_id;
+          log('CALL-ACCEPTED', `Call ${callId} accepted by ${socket.id}`);
+        } else if (response === 'rejected' || response === 'missed' || response === 'cancelled' || response === 'failed') {
+          log('CALL-REJECTED', `Call ${callId} ${response} by ${socket.id}`);
+          cleanupActiveCall(callId, response);
+        }
+      }
+      clearPendingCall(callId);
+    }
+
+    let targetSocketId = isSocketAlive(data?.caller_socket_id) ? data.caller_socket_id : null;
+
+    if (!targetSocketId && data?.caller_user_id) {
+      const ids = userSockets.get(String(data.caller_user_id));
+      if (ids?.size) {
+        const fallback = [...ids].find((sid) => isSocketAlive(sid)) || null;
+        if (fallback) {
+          targetSocketId = fallback;
+          log('CALL-RESPONSE', 'Caller socket stale; resolved via caller_user_id', {
+            caller_socket_id: data.caller_socket_id,
+            fallback_socket_id: targetSocketId,
+            caller_user_id: data.caller_user_id,
+          });
+        }
+      }
+    }
+
+    if (targetSocketId) {
+      io.to(targetSocketId).emit('call_response', { ...data, caller_socket_id: targetSocketId });
+    } else if (data?.caller_socket_id) {
+      log('CALL-RESPONSE', 'Caller unreachable, dropping response', {
+        caller_socket_id: data.caller_socket_id,
+        response,
+        call_id: callId,
+      });
+      safeEmit(socket.id, 'voice_call_end', { call_id: callId, reason: 'caller-unreachable' });
+      safeEmit(socket.id, 'call-ended', { call_id: callId, reason: 'caller-unreachable' });
+      if (callId) cleanupActiveCall(callId, 'caller-disconnected');
+    } else {
+      log('CALL-RESPONSE', 'call_response missing caller_socket_id', { call_id: callId });
+    }
+  });
+
+  // ── Legacy protocol: alert response (unchanged) ───────────────────────
+  socket.on('alert_response', async (data = {}) => {
+    let smsSent = false;
+    let smsError = null;
+
+    if (data?.request_id) pushService.stopCallReminders(data.request_id);
+
+    if (data.scanner_user_id) {
+      try {
+        const [rows] = await pool.execute(
+          'SELECT phone FROM users WHERE id = ?',
+          [data.scanner_user_id]
+        );
+
+        const scannerPhone = rows[0]?.phone;
+        if (scannerPhone) {
+          const smsResult = await notificationService.sendSMS(
+            scannerPhone,
+            data.response_text || 'Owner responded to your vehicle alert.'
+          );
+          smsSent = !!smsResult.success;
+          smsError = smsResult.error || null;
+        } else {
+          smsError = 'Scanner phone number not found';
+        }
+      } catch (error) {
+        smsError = error.message;
+        console.error('Alert response SMS failed:', error);
+      }
+    } else {
+      smsError = 'Scanner user id not provided';
+    }
+
+    const responsePayload = {
+      ...data,
+      sms_sent: smsSent,
+      sms_error: smsError,
+    };
+
+    const scannerSocketId =
+      data.scanner_socket_id ||
+      (data.scanner_user_id ? connectedUsers.get(String(data.scanner_user_id)) : null);
+
+    if (scannerSocketId) {
+      io.to(scannerSocketId).emit('alert_response', responsePayload);
+    } else {
+      console.warn('Alert response could not be delivered: scanner socket not found', {
+        request_id: data.request_id,
+        scanner_user_id: data.scanner_user_id,
+      });
+    }
+  });
+
+  // ── Signaling relays (offer / answer / ICE) ───────────────────────────
+  // Every relay:
+  //  - resolves the intended recipient (target_socket_id or target_user_id)
+  //  - validates the recipient is still connected
+  //  - injects caller_socket_id / sender_socket_id (REQUIRED by the legacy app)
+  //  - emits BOTH the new event name and the legacy event name
+  //  - acknowledges the sender with delivery status
+  const registerRelay = (eventName, legacyEventName) => {
+    socket.on(eventName, (data = {}, ack) => {
+      try {
+        const senderUserId = socketOwners.get(socket.id) || data?.caller_user_id || null;
+        const { socketId: targetSocketId, error } = resolveTarget(data, eventName);
+        if (error) {
+          log('RELAY-BLOCKED', `${eventName} not forwarded`, {
+            error,
+            target: data?.target_socket_id || data?.target_user_id,
+            sender: socket.id,
+          });
+          ackErr(ack, error);
+          return;
+        }
+        if (targetSocketId === socket.id) {
+          ackErr(ack, 'SELF_RELAY', { message: 'You cannot send signaling to yourself' });
+          return;
+        }
+
+        const payload = {
+          ...(data || {}),
+          caller_socket_id: socket.id,
+          sender_socket_id: socket.id,
+          sender_user_id: senderUserId,
+          forwarded_at: nowIso(),
+        };
+
+        const delivered = safeEmit(targetSocketId, legacyEventName, payload);
+        if (legacyEventName !== eventName) {
+          safeEmit(targetSocketId, eventName, payload);
+        }
+
+        if (delivered) {
+          log(`RELAY-${eventName.toUpperCase()}`, `${eventName} forwarded ${socket.id} -> ${targetSocketId}`, {
+            call_id: data?.call_id || null,
+          });
+          ackOk(ack, { delivered: true, target_socket_id: targetSocketId });
+        } else {
+          ackErr(ack, 'TARGET_OFFLINE', { message: 'Target socket is no longer connected' });
+        }
+      } catch (err) {
+        log('RELAY-ERROR', `${eventName} relay failed`, { error: err.message });
+        ackErr(ack, 'INTERNAL_ERROR', { message: err.message });
+      }
+    });
+  };
+
+  // New protocol + legacy WebRTC events (listen on BOTH the new and the
+  // legacy event names so the current app keeps working unchanged)
+  registerRelay('offer', 'webrtc_offer');
+  registerRelay('webrtc_offer', 'webrtc_offer');
+  registerRelay('answer', 'webrtc_answer');
+  registerRelay('webrtc_answer', 'webrtc_answer');
+  registerRelay('ice-candidate', 'webrtc_ice_candidate');
+  registerRelay('webrtc_ice_candidate', 'webrtc_ice_candidate');
+
+  // Legacy voice events (older builds)
+  registerRelay('voice_offer', 'voice_offer');
+  registerRelay('voice_answer', 'voice_answer');
+  registerRelay('voice_ice_candidate', 'voice_ice_candidate');
+
+  // ── Call end events ───────────────────────────────────────────────────
+  socket.on('call-ended', (data = {}, ack) => {
+    try {
+      const callId = data?.call_id;
+      if (callId) {
+        if (activeCalls.has(callId)) cleanupActiveCall(callId, data?.reason || 'ended');
+        clearPendingCall(callId);
+      }
+      const { socketId: targetSocketId, error } = resolveTarget(data, 'call-ended');
+      if (error) {
+        ackErr(ack, error);
+        return;
+      }
+      const payload = {
+        ...(data || {}),
+        sender_socket_id: socket.id,
+        sender_user_id: socketOwners.get(socket.id) || null,
+        forwarded_at: nowIso(),
+      };
+      safeEmit(targetSocketId, 'call-ended', payload);
+      safeEmit(targetSocketId, 'voice_call_end', payload); // legacy alias
+      log('CALL-ENDED', `call-ended forwarded ${socket.id} -> ${targetSocketId}`, { call_id: callId });
+      ackOk(ack, { delivered: true });
+    } catch (err) {
+      log('CALL-ENDED-ERROR', 'call-ended handler failed', { error: err.message });
+      ackErr(ack, 'INTERNAL_ERROR', { message: err.message });
+    }
+  });
+
+  socket.on('voice_call_end', (data = {}) => {
+    try {
+      const callId = data?.call_id;
+      const target = data?.target_socket_id;
+      if (callId) {
+        if (activeCalls.has(callId)) cleanupActiveCall(callId, data?.reason || 'ended');
+        clearPendingCall(callId);
+      }
+      if (target) {
+        if (isSocketAlive(target)) {
+          io.to(target).emit('voice_call_end', {
+            ...(data || {}),
+            sender_socket_id: socket.id,
+            sender_user_id: socketOwners.get(socket.id) || null,
+            forwarded_at: nowIso(),
+          });
+        } else {
+          log('CALL-ENDED', 'voice_call_end target socket gone', { call_id: callId, target_socket_id: target });
+        }
+      }
+      log('CALL-ENDED', `voice_call_end from ${socket.id}`, { call_id: callId, target_socket_id: target });
+    } catch (err) {
+      log('CALL-ENDED-ERROR', 'voice_call_end handler failed', { error: err.message });
+    }
+  });
+
+  // ── Track calls delivered by the legacy HTTP route (30s timeout) ──────
+  socket.onAnyOutgoing((event, ...args) => {
+    if (event === 'incoming_call') {
+      const payload = args[0];
+      if (payload && payload.call_id && (payload.caller_socket_id || payload.scanner_socket_id)) {
+        trackIncomingCall(socket.id, payload);
+      }
+    }
+  });
+
+  // ── Disconnect: full cleanup + peer notification ──────────────────────
+  socket.on('disconnect', () => {
+    const userId = unregisterSocket(socket.id);
+    log('DISCONNECT', `Socket ${socket.id} disconnected`, { user_id: userId });
+
+    // 1) Clean up every active call involving this socket
+    for (const [callId, call] of [...activeCalls.entries()]) {
+      if (call.callerSocketId === socket.id) {
+        log('CALL-CANCELLED', `Call ${callId} cancelled — caller disconnected`);
+        cleanupActiveCall(callId, 'caller-disconnected');
+        clearPendingCall(callId);
+        safeEmit(call.targetSocketId, 'voice_call_end', { call_id: callId, reason: 'caller-disconnected' });
+        safeEmit(call.targetSocketId, 'call-ended', { call_id: callId, reason: 'caller-disconnected' });
+      } else if (call.targetSocketId === socket.id) {
+        log('CALL-ENDED', `Call ${callId} ended — recipient disconnected`);
+        cleanupActiveCall(callId, 'recipient-disconnected');
+        clearPendingCall(callId);
+        safeEmit(call.callerSocketId, 'call_response', {
+          call_id: callId,
+          caller_socket_id: call.callerSocketId,
+          caller_user_id: call.callerUserId || null,
+          response: 'missed',
+          message: 'Owner went offline.',
+        });
+        safeEmit(call.callerSocketId, 'voice_call_end', { call_id: callId, reason: 'recipient-disconnected' });
+        safeEmit(call.callerSocketId, 'call-ended', { call_id: callId, reason: 'recipient-disconnected' });
+      }
+    }
+
+    // 2) Notify the user's other devices that this device went offline (new protocol)
+    if (userId) {
+      for (const sid of getSocketIdsForUser(userId)) {
+        safeEmit(sid, 'user-disconnected', { user_id: userId, socket_id: socket.id });
+      }
+    }
+
+    // 3) Legacy pendingCalls cleanup (unchanged behavior)
+    if (userId) {
+      for (const [callId, pendingCall] of [...pendingCalls.entries()]) {
+        if (pendingCall.callerSocketId === socket.id) {
+          if (pendingCall.timeoutId) clearTimeout(pendingCall.timeoutId);
+          pushService.stopCallReminders(callId);
+          pendingCalls.delete(callId);
+          log('PENDING-CALL-CANCELLED', `Pending call ${callId} cancelled due to caller disconnect`);
+        }
+      }
+      for (const [callId, pendingCall] of [...pendingCalls.entries()]) {
+        if (String(pendingCall.ownerId) === String(userId)) {
+          if (pendingCall.timeoutId) clearTimeout(pendingCall.timeoutId);
+          // Let ring/alert play for ~45 more seconds after disconnect
+          setTimeout(() => pushService.stopCallReminders(callId), 45000);
+          pendingCalls.delete(callId);
+          log('PENDING-CALL-CANCELLED', `Pending call ${callId} will stop ringing in 45s due to owner disconnect`);
+          // Notify scanner that owner went offline
+          if (pendingCall.callerSocketId) {
+            io.to(pendingCall.callerSocketId).emit(pendingCall.type === 'ring' ? 'alert_response' : 'call_response', {
+              call_id: callId,
+              request_id: callId,
+              caller_socket_id: pendingCall.callerSocketId,
+              response: 'missed',
+              message: 'Owner went offline.',
+            });
+          }
+        }
+      }
+    }
+  });
+});
+
+const PORT = process.env.PORT || 5005;
+const buildConferenceTwiml = (roomId) => {
+  const safeRoomId = String(roomId).replace(/[<>&'"]/g, (char) => (
+    {
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;',
+      "'": '&apos;',
+      '"': '&quot;',
+    }[char]
+  ));
+
+  return `<Response><Dial><Conference startConferenceOnEnter="true" endConferenceOnExit="false" waitUrl="" beep="false">${safeRoomId}</Conference></Dial></Response>`;
+};
+
+app.use(helmet());
+app.use(cors());
+
+const rateLimitHandler = (req, res) => {
+  res.status(429).json({ error: 'Too many requests. Please try again later.' });
+};
+
+const apiLimiter = rateLimit({
+  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_MAX) || 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitHandler,
+});
+
+const authLimiter = rateLimit({
+  windowMs: Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX) || 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitHandler,
+});
+
+app.use('/api/auth/login', authLimiter);
+app.use('/api/', apiLimiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Mount routes
+app.use('/api/auth',     authRoutes);
+app.use('/api/vehicles', vehicleRoutes);
+app.use('/api/qr',       qrRoutes);
+app.use('/api/scan',     scanRoutes);
+app.use('/api/admin',    adminRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/communication-settings', communicationSettingsRoutes);
+app.use('/api/private-call', privateCallRoutes);
+
+// Time-limited TURN credentials for app-to-app WebRTC calls (coturn).
+app.get('/api/turn-credentials', (req, res) => {
+  try {
+    const secret = process.env.TURN_SECRET || '';
+    const host = process.env.TURN_SERVER || '72.61.236.126:3478';
+    if (!secret) {
+      return res.status(500).json({ success: false, error: 'TURN not configured' });
+    }
+    const ttl = Number(process.env.TURN_TTL_SECONDS || 3600);
+    const expiry = Math.floor(Date.now() / 1000) + ttl;
+    const username = `${expiry}:${crypto.randomBytes(8).toString('hex')}`;
+    const credential = crypto.createHmac('sha1', secret).update(username).digest('base64');
+    return res.json({
+      success: true,
+      ttl,
+      ice_servers: [
+        { urls: 'stun:stun.l.google.com:19302' },
+        { urls: 'stun:stun1.l.google.com:19302' },
+        { urls: `turn:${host}?transport=udp`, username, credential },
+        { urls: `turn:${host}?transport=tcp`, username, credential },
+        { urls: `turns:${host}?transport=tcp`, username, credential },
+      ],
+    });
+  } catch (err) {
+    console.error('TURN credentials error:', err);
+    return res.status(500).json({ success: false, error: 'Failed to issue TURN credentials' });
+  }
+});
+
+// Start Twilio conference call between two phone numbers.
+app.post('/api/start-call', async (req, res) => {
+  try {
+    const { userA, userB, caller_phone, qr_code_id, roomId = 'demo' } = req.body;
+    const {
+      TWILIO_ACCOUNT_SID,
+      TWILIO_AUTH_TOKEN,
+      TWILIO_PHONE_NUMBER,
+    } = process.env;
+
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
+      return res.status(500).json({
+        success: false,
+        error: 'Twilio credentials are not configured',
+      });
+    }
+
+    let resolvedCaller = userA || caller_phone || null;
+    let resolvedReceiver = userB || null;
+    let resolvedRoomId = roomId || qr_code_id || 'demo';
+
+    if ((!resolvedCaller || !resolvedReceiver) && qr_code_id) {
+      const [rows] = await pool.execute(
+        `SELECT
+           COALESCE(NULLIF(v.mobile_number, ''), u.phone) AS owner_phone
+         FROM qr_codes qc
+         JOIN users u ON qc.user_id = u.id
+    LEFT JOIN vehicles v ON qc.vehicle_id = v.id
+        WHERE qc.qr_code_id = ? AND qc.is_active = TRUE
+        LIMIT 1`,
+        [qr_code_id]
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'QR code not found or inactive',
+        });
+      }
+
+      resolvedReceiver = resolvedReceiver || rows[0].owner_phone;
+      resolvedRoomId = resolvedRoomId || qr_code_id;
+    }
+
+    if (!resolvedCaller || !resolvedReceiver) {
+      return res.status(400).json({
+        success: false,
+        error: 'Provide userA and userB, or caller_phone and a valid qr_code_id',
+      });
+    }
+
+    resolvedCaller = notificationService.formatPhoneNumber(resolvedCaller);
+    resolvedReceiver = notificationService.formatPhoneNumber(resolvedReceiver);
+
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const conferenceTwiml = buildConferenceTwiml(resolvedRoomId);
+
+    await Promise.all([
+      client.calls.create({
+        to: resolvedCaller,
+        from: TWILIO_PHONE_NUMBER,
+        twiml: conferenceTwiml,
+      }),
+      client.calls.create({
+        to: resolvedReceiver,
+        from: TWILIO_PHONE_NUMBER,
+        twiml: conferenceTwiml,
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      message: 'Calling both users...',
+      roomId: resolvedRoomId,
+    });
+  } catch (err) {
+    console.error('Twilio start call failed:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.code === 21219
+        ? 'Twilio trial accounts can only call verified numbers. Verify both numbers or upgrade the account.'
+        : err?.code === 21608
+          ? 'Twilio trial accounts can only send SMS to verified numbers.'
+          : err.message,
+    });
+  }
+});
+
+// Fetch the latest Twilio call status, optionally filtered by phone number.
+app.get('/api/call-status', async (req, res) => {
+  try {
+    const { phone, limit = '5' } = req.query;
+    const {
+      TWILIO_ACCOUNT_SID,
+      TWILIO_AUTH_TOKEN,
+    } = process.env;
+
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+      return res.status(500).json({
+        success: false,
+        error: 'Twilio credentials are not configured',
+      });
+    }
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 5, 1), 20);
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const calls = await client.calls.list({ limit: parsedLimit });
+
+    const normalizedPhone = phone ? String(phone).trim() : '';
+    const filteredCalls = normalizedPhone
+      ? calls.filter((call) =>
+          String(call.to || '').includes(normalizedPhone) ||
+          String(call.from || '').includes(normalizedPhone)
+        )
+      : calls;
+
+    const latestCall = filteredCalls[0] || null;
+
+    return res.json({
+      success: true,
+      count: filteredCalls.length,
+      latest: latestCall
+        ? {
+            sid: latestCall.sid,
+            status: latestCall.status,
+            from: latestCall.from,
+            to: latestCall.to,
+            direction: latestCall.direction,
+            duration: latestCall.duration,
+            startTime: latestCall.startTime,
+            endTime: latestCall.endTime,
+            price: latestCall.price,
+            priceUnit: latestCall.priceUnit,
+            errorCode: latestCall.errorCode,
+            errorMessage: latestCall.errorMessage,
+          }
+        : null,
+      calls: filteredCalls.map((call) => ({
+        sid: call.sid,
+        status: call.status,
+        from: call.from,
+        to: call.to,
+        direction: call.direction,
+        duration: call.duration,
+        startTime: call.startTime,
+        endTime: call.endTime,
+        price: call.price,
+        priceUnit: call.priceUnit,
+        errorCode: call.errorCode,
+        errorMessage: call.errorMessage,
+      })),
+    });
+  } catch (err) {
+    console.error('Twilio call status fetch failed:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+// TwiML endpoint used by Twilio when each outbound call is answered.
+app.post('/twilio/conference', (req, res) => {
+  const room = req.query.room || 'demo';
+
+  res.type('text/xml');
+  res.send(buildConferenceTwiml(room));
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', message: 'qralertgo API is running' });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+// 404
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running → http://localhost:${PORT}`);
+  console.log(`Server accessible → http://10.26.246.153:${PORT}`);
+});

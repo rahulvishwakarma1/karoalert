@@ -1,0 +1,255 @@
+const twilio = require('twilio');
+const { pool } = require('../config/database');
+
+const formatPhoneNumber = (phoneNumber) => {
+  const raw = String(phoneNumber || '').trim();
+  if (!raw) return raw;
+  if (raw.startsWith('+')) return raw;
+
+  const digits = raw.replace(/\D/g, '');
+  if (digits.length === 10) {
+    return `${process.env.DEFAULT_COUNTRY_CODE || '+91'}${digits}`;
+  }
+  if (digits.length === 12 && digits.startsWith('91')) {
+    return `+${digits}`;
+  }
+
+  return raw;
+};
+
+// Map Twilio REST error codes to clear, actionable messages (never crash).
+const twilioErrorMessage = (error) => {
+  if (!error) return 'Unknown Twilio error';
+  const code = error.code;
+  const status = error.status;
+
+  if (code === 20003 || status === 401) {
+    return 'Twilio authentication failed: Account SID or Auth Token is invalid.';
+  }
+  if (code === 21608) {
+    return 'Twilio trial account: recipient number is not verified. Verify the number in the Twilio console or upgrade the account.';
+  }
+  if (code === 21219) {
+    return 'Twilio trial account: destination number is not verified for calls.';
+  }
+  if (code === 21610) {
+    return 'Recipient has opted out of SMS.';
+  }
+  if (code === 30007) {
+    return 'Twilio message blocked (carrier filter).';
+  }
+  if (code === 21408) {
+    return 'Twilio messaging service not provisioned for this channel.';
+  }
+
+  return error.message || `Twilio error ${code || ''}`.trim();
+};
+
+const logTwilioError = (action, error) => {
+  const code = error?.code || null;
+  const status = error?.status || null;
+  const moreInfo = error?.moreInfo || null;
+  console.error(
+    `[TWILIO] ${action} failed: code=${code} status=${status} moreInfo=${moreInfo || '-'} message=${twilioErrorMessage(error)}`
+  );
+};
+
+class NotificationService {
+  constructor() {
+    this.client = null;
+    if (this.isConfigured()) {
+      this.client = twilio(
+        process.env.TWILIO_ACCOUNT_SID,
+        process.env.TWILIO_AUTH_TOKEN
+      );
+    }
+  }
+
+  isConfigured() {
+    return !!(
+      process.env.TWILIO_ACCOUNT_SID &&
+      process.env.TWILIO_AUTH_TOKEN &&
+      process.env.TWILIO_PHONE_NUMBER
+    );
+  }
+
+  formatPhoneNumber(phoneNumber) {
+    return formatPhoneNumber(phoneNumber);
+  }
+
+  async sendSMS(phoneNumber, message) {
+    try {
+      if (!this.isConfigured()) {
+        return { success: false, error: 'Twilio SMS is not configured' };
+      }
+
+      if (!this.client) {
+        this.client = twilio(
+          process.env.TWILIO_ACCOUNT_SID,
+          process.env.TWILIO_AUTH_TOKEN
+        );
+      }
+
+      const result = await this.client.messages.create({
+        body: message,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: formatPhoneNumber(phoneNumber)
+      });
+
+      console.log('SMS sent successfully:', result.sid);
+      return { success: true, sid: result.sid };
+    } catch (error) {
+      logTwilioError('SMS', error);
+      return { success: false, error: twilioErrorMessage(error) };
+    }
+  }
+
+  async sendWhatsApp(phoneNumber, message) {
+    try {
+      if (!this.isConfigured()) {
+        return { success: false, error: 'Twilio WhatsApp is not configured' };
+      }
+
+      if (!this.client) {
+        this.client = twilio(
+          process.env.TWILIO_ACCOUNT_SID,
+          process.env.TWILIO_AUTH_TOKEN
+        );
+      }
+
+      const fromNumber = process.env.TWILIO_WHATSAPP_NUMBER || process.env.TWILIO_PHONE_NUMBER;
+      const formatWhatsApp = (value) => {
+        const formatted = formatPhoneNumber(value);
+        return formatted.startsWith('whatsapp:') ? formatted : `whatsapp:${formatted}`;
+      };
+
+      const result = await this.client.messages.create({
+        body: message,
+        from: formatWhatsApp(fromNumber),
+        to: formatWhatsApp(phoneNumber)
+      });
+
+      console.log('WhatsApp sent successfully:', result.sid);
+      return { success: true, sid: result.sid };
+    } catch (error) {
+      logTwilioError('WhatsApp', error);
+      return { success: false, error: twilioErrorMessage(error) };
+    }
+  }
+
+  async makeCall(phoneNumber, message) {
+    try {
+      if (!this.isConfigured()) {
+        return { success: false, error: 'Twilio calls are not configured' };
+      }
+
+      if (!this.client) {
+        this.client = twilio(
+          process.env.TWILIO_ACCOUNT_SID,
+          process.env.TWILIO_AUTH_TOKEN
+        );
+      }
+
+      const twiml = `<Response><Say>${message}</Say></Response>`;
+
+      const result = await this.client.calls.create({
+        twiml: twiml,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: formatPhoneNumber(phoneNumber)
+      });
+
+      console.log('Call initiated successfully:', result.sid);
+      return { success: true, sid: result.sid };
+    } catch (error) {
+      logTwilioError('Call', error);
+      return { success: false, error: twilioErrorMessage(error) };
+    }
+  }
+
+  async processNotification(userId, vehicleId, scanLogId, notificationType = 'SMS') {
+    try {
+      // Get user and vehicle information
+      const [results] = await pool.execute(
+        `SELECT u.name, u.phone, u.email, v.license_plate, sl.scanner_location
+         FROM users u
+         JOIN vehicles v ON u.id = v.user_id
+         JOIN scan_logs sl ON v.id = (SELECT vehicle_id FROM qr_codes WHERE qr_code_id = sl.qr_code_id)
+         WHERE u.id = ? AND v.id = ? AND sl.id = ?`,
+        [userId, vehicleId, scanLogId]
+      );
+
+      if (results.length === 0) {
+        throw new Error('User or vehicle not found');
+      }
+
+      const user = results[0];
+
+      // Create notification message
+      const message = `Hi ${user.name}, your vehicle (${user.license_plate}) has been scanned. Someone may need you to move your car. Please check your vehicle if possible.`;
+
+      let notificationResult;
+
+      if (notificationType === 'SMS') {
+        notificationResult = await this.sendSMS(user.phone, message);
+      } else if (notificationType === 'CALL') {
+        notificationResult = await this.makeCall(user.phone, message);
+      } else {
+        throw new Error('Invalid notification type');
+      }
+
+      // Update notification record
+      const status = notificationResult.success ? 'SENT' : 'FAILED';
+      const sentAt = notificationResult.success ? new Date() : null;
+
+      await pool.execute(
+        `UPDATE notifications
+         SET status = ?, sent_at = ?, message = ?
+         WHERE user_id = ? AND vehicle_id = ? AND scan_log_id = ?`,
+        [status, sentAt, message, userId, vehicleId, scanLogId]
+      );
+
+      // Update scan log
+      if (notificationResult.success) {
+        await pool.execute(
+          'UPDATE scan_logs SET notification_sent = TRUE WHERE id = ?',
+          [scanLogId]
+        );
+      }
+
+      return notificationResult;
+    } catch (error) {
+      console.error('Notification processing error:', error);
+      throw error;
+    }
+  }
+
+  async retryFailedNotifications() {
+    try {
+      const [failedNotifications] = await pool.execute(
+        `SELECT n.id, n.user_id, n.vehicle_id, n.scan_log_id, n.notification_type
+         FROM notifications n
+         WHERE n.status = 'FAILED'
+         AND n.created_at > DATE_SUB(NOW(), INTERVAL 1 HOUR)
+         ORDER BY n.created_at ASC
+         LIMIT 10`
+      );
+
+      for (const notification of failedNotifications) {
+        try {
+          await this.processNotification(
+            notification.user_id,
+            notification.vehicle_id,
+            notification.scan_log_id,
+            notification.notification_type
+          );
+        } catch (error) {
+          console.error(`Retry failed for notification ${notification.id}:`, error);
+        }
+      }
+    } catch (error) {
+      console.error('Retry failed notifications error:', error);
+    }
+  }
+}
+
+module.exports = new NotificationService();
