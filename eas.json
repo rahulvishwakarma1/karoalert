@@ -1,0 +1,36 @@
+{
+  "cli": {
+    "version": ">= 19.0.1",
+    "appVersionSource": "local"
+  },
+  "build": {
+    "development": {
+      "developmentClient": true,
+      "distribution": "internal"
+    },
+    "apk": {
+      "developmentClient": false,
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "preview": {
+      "developmentClient": false,
+      "distribution": "internal",
+      "android": {
+        "buildType": "apk"
+      }
+    },
+    "production": {
+      "developmentClient": false,
+      "autoIncrement": false,
+      "env": {
+        "EXPO_PUBLIC_API_URL": "https://app.shreesswpl.com"
+      }
+    }
+  },
+  "submit": {
+    "production": {}
+  }
+}

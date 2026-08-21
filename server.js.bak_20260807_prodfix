@@ -1,0 +1,469 @@
+const express = require('express');
+const cors    = require('cors');
+const helmet  = require('helmet');
+const rateLimit = require('express-rate-limit');
+const path    = require('path');
+const http    = require('http');
+const { Server } = require('socket.io');
+const twilio  = require('twilio');
+
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+if (!process.env.JWT_SECRET) {
+  process.env.JWT_SECRET = 'mySuperSecretKey123';
+}
+console.log('JWT_SECRET loaded:', process.env.JWT_SECRET ? '✅' : '❌');
+
+const authRoutes     = require('./routes/auth');
+const vehicleRoutes  = require('./routes/vehicles');
+const qrRoutes       = require('./routes/qr');
+const scanRoutes     = require('./routes/scan');
+const adminRoutes    = require('./routes/admin');
+const paymentRoutes  = require('./routes/payments');
+const communicationSettingsRoutes = require('./routes/communication-settings');
+const privateCallRoutes = require('./routes/private-call');
+const membershipRoutes = require('./routes/membership');
+const { pool } = require('./config/database');
+const notificationService = require('./services/notificationService');
+const pushService = require('./services/pushService');
+
+const app = express();
+app.set('trust proxy', true);
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+const connectedUsers = new Map();
+const pendingCalls = new Map();
+const activeDeductions = new Map();
+app.set('io', io);
+app.set('connectedUsers', connectedUsers);
+app.set('pendingCalls', pendingCalls);
+app.set('activeDeductions', activeDeductions);
+
+io.on('connection', (socket) => {
+  console.log('Client connected:', socket.id);
+
+  socket.on('register', (userId) => {
+    connectedUsers.set(String(userId), socket.id);
+    console.log(`User ${userId} registered with socket ${socket.id}`);
+  });
+
+  socket.on('call_response', (data) => {
+    if (data?.call_id) {
+      const pendingCall = pendingCalls.get(data.call_id);
+      if (pendingCall?.timeoutId) clearTimeout(pendingCall.timeoutId);
+      // Stop the repeated push reminders once the owner responds.
+      pushService.stopCallReminders(data.call_id);
+      pendingCalls.delete(data.call_id);
+    }
+
+    if (data?.caller_socket_id) {
+      io.to(data.caller_socket_id).emit('call_response', data);
+    }
+  });
+
+  // Owner dismissed the ring/call from the modal -> cancel pending reminder loops server-side.
+  socket.on('dismiss_incoming', (data) => {
+    const key = data?.call_id || data?.request_id || null;
+    if (!key) return;
+    const pendingCall = pendingCalls.get(key);
+    if (pendingCall?.timeoutId) clearTimeout(pendingCall.timeoutId);
+    pushService.stopCallReminders(key);
+    pendingCalls.delete(key);
+    console.log(`Incoming ${pendingCall?.type || 'call/alert'} ${key} dismissed by owner; reminders stopped`);
+  });
+
+  socket.on('alert_response', async (data = {}) => {
+    let smsSent = false;
+    let smsError = null;
+
+    if (data.scanner_user_id) {
+      try {
+        const [rows] = await pool.execute(
+          'SELECT phone FROM users WHERE id = ?',
+          [data.scanner_user_id]
+        );
+
+        const scannerPhone = rows[0]?.phone;
+        if (scannerPhone) {
+          const smsResult = await notificationService.sendSMS(
+            scannerPhone,
+            data.response_text || 'Owner responded to your vehicle alert.'
+          );
+          smsSent = !!smsResult.success;
+          smsError = smsResult.error || null;
+        } else {
+          smsError = 'Scanner phone number not found';
+        }
+      } catch (error) {
+        smsError = error.message;
+        console.error('Alert response SMS failed:', error);
+      }
+    } else {
+      smsError = 'Scanner user id not provided';
+    }
+
+    // Owner responded to the alert -> cancel the ringing/reminder loop.
+    if (data.request_id && pendingCalls.has(data.request_id)) {
+      const pendingCall = pendingCalls.get(data.request_id);
+      if (pendingCall?.timeoutId) clearTimeout(pendingCall.timeoutId);
+      pushService.stopCallReminders(data.request_id);
+      pendingCalls.delete(data.request_id);
+    }
+
+    const responsePayload = {
+      ...data,
+      sms_sent: smsSent,
+      sms_error: smsError,
+    };
+
+    const scannerSocketId =
+      data.scanner_socket_id ||
+      (data.scanner_user_id ? connectedUsers.get(String(data.scanner_user_id)) : null);
+
+    if (scannerSocketId) {
+      io.to(scannerSocketId).emit('alert_response', responsePayload);
+    } else {
+      console.warn('Alert response could not be delivered: scanner socket not found', {
+        request_id: data.request_id,
+        scanner_user_id: data.scanner_user_id,
+      });
+    }
+  });
+
+  socket.on('voice_offer', (data) => {
+    if (data?.target_socket_id) {
+      io.to(data.target_socket_id).emit('voice_offer', data);
+    }
+  });
+
+  socket.on('voice_answer', (data) => {
+    if (data?.target_socket_id) {
+      io.to(data.target_socket_id).emit('voice_answer', data);
+    }
+  });
+
+  socket.on('voice_ice_candidate', (data) => {
+    if (data?.target_socket_id) {
+      io.to(data.target_socket_id).emit('voice_ice_candidate', data);
+    }
+  });
+
+  socket.on('voice_call_end', (data) => {
+    if (data?.target_socket_id) {
+      io.to(data.target_socket_id).emit('voice_call_end', data);
+    }
+  });
+
+  socket.on('disconnect', () => {
+    for (let [userId, socketId] of connectedUsers.entries()) {
+      if (socketId === socket.id) {
+        connectedUsers.delete(userId);
+        console.log(`User ${userId} disconnected`);
+
+        // Clean up any pending calls initiated by this user (as scanner)
+        for (const [callId, pendingCall] of pendingCalls.entries()) {
+          if (pendingCall.callerSocketId === socket.id) {
+            if (pendingCall.timeoutId) clearTimeout(pendingCall.timeoutId);
+            pushService.stopCallReminders(callId);
+            pendingCalls.delete(callId);
+            console.log(`Pending call ${callId} cancelled due to caller disconnect`);
+          }
+        }
+
+        // Clean up pending calls for this user (as owner receiving calls/alerts)
+        for (const [callId, pendingCall] of pendingCalls.entries()) {
+          if (pendingCall.ownerId === userId) {
+            if (pendingCall.timeoutId) clearTimeout(pendingCall.timeoutId);
+            // Let ring/alert play for ~45 more seconds after disconnect
+            setTimeout(() => pushService.stopCallReminders(callId), 45000);
+            pendingCalls.delete(callId);
+            console.log(`Pending call ${callId} will stop ringing in 45s due to owner disconnect`);
+            // Notify scanner that owner went offline
+            if (pendingCall.callerSocketId) {
+              io.to(pendingCall.callerSocketId).emit(pendingCall.type === 'ring' ? 'alert_response' : 'call_response', {
+                call_id: callId,
+                request_id: callId,
+                caller_socket_id: pendingCall.callerSocketId,
+                response: 'missed',
+                message: 'Owner went offline.',
+              });
+            }
+          }
+        }
+        break;
+      }
+    }
+  });
+});
+
+const PORT = process.env.PORT || 5005;
+const buildConferenceTwiml = (roomId) => {
+  const safeRoomId = String(roomId).replace(/[<>&'"]/g, (char) => (
+    {
+      '<': '&lt;',
+      '>': '&gt;',
+      '&': '&amp;',
+      "'": '&apos;',
+      '"': '&quot;',
+    }[char]
+  ));
+
+  return `<Response><Dial><Conference startConferenceOnEnter="true" endConferenceOnExit="false" waitUrl="" beep="false">${safeRoomId}</Conference></Dial></Response>`;
+};
+
+app.use(helmet());
+app.use(cors());
+
+const rateLimitHandler = (req, res) => {
+  res.status(429).json({ error: 'Too many requests. Please try again later.' });
+};
+
+const apiLimiter = rateLimit({
+  windowMs: Number(process.env.RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: Number(process.env.RATE_LIMIT_MAX) || 1000,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitHandler,
+});
+
+const authLimiter = rateLimit({
+  windowMs: Number(process.env.AUTH_RATE_LIMIT_WINDOW_MS) || 15 * 60 * 1000,
+  max: Number(process.env.AUTH_RATE_LIMIT_MAX) || 25,
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: rateLimitHandler,
+});
+
+app.use('/api/auth/login', authLimiter);
+app.use('/api/', apiLimiter);
+
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Mount routes
+app.use('/api/auth',     authRoutes);
+app.use('/api/vehicles', vehicleRoutes);
+app.use('/api/qr',       qrRoutes);
+app.use('/api/scan',     scanRoutes);
+app.use('/api/admin',    adminRoutes);
+app.use('/api/payments', paymentRoutes);
+app.use('/api/communication-settings', communicationSettingsRoutes);
+app.use('/api/private-call', privateCallRoutes);
+app.use('/api/membership', membershipRoutes);
+
+// Start Twilio conference call between two phone numbers.
+app.post('/api/start-call', async (req, res) => {
+  try {
+    const { userA, userB, caller_phone, qr_code_id, roomId = 'demo' } = req.body;
+    const {
+      TWILIO_ACCOUNT_SID,
+      TWILIO_AUTH_TOKEN,
+      TWILIO_PHONE_NUMBER,
+    } = process.env;
+
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_PHONE_NUMBER) {
+      return res.status(500).json({
+        success: false,
+        error: 'Twilio credentials are not configured',
+      });
+    }
+
+    let resolvedCaller = userA || caller_phone || null;
+    let resolvedReceiver = userB || null;
+    let resolvedRoomId = roomId || qr_code_id || 'demo';
+
+    if ((!resolvedCaller || !resolvedReceiver) && qr_code_id) {
+      const [rows] = await pool.execute(
+        `SELECT
+           COALESCE(NULLIF(v.mobile_number, ''), u.phone) AS owner_phone
+         FROM qr_codes qc
+         JOIN users u ON qc.user_id = u.id
+    LEFT JOIN vehicles v ON qc.vehicle_id = v.id
+        WHERE qc.qr_code_id = ? AND qc.is_active = TRUE
+        LIMIT 1`,
+        [qr_code_id]
+      );
+
+      if (rows.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'QR code not found or inactive',
+        });
+      }
+
+      resolvedReceiver = resolvedReceiver || rows[0].owner_phone;
+      resolvedRoomId = resolvedRoomId || qr_code_id;
+    }
+
+    if (!resolvedCaller || !resolvedReceiver) {
+      return res.status(400).json({
+        success: false,
+        error: 'Provide userA and userB, or caller_phone and a valid qr_code_id',
+      });
+    }
+
+    resolvedCaller = notificationService.formatPhoneNumber(resolvedCaller);
+    resolvedReceiver = notificationService.formatPhoneNumber(resolvedReceiver);
+
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const conferenceTwiml = buildConferenceTwiml(resolvedRoomId);
+
+    await Promise.all([
+      client.calls.create({
+        to: resolvedCaller,
+        from: TWILIO_PHONE_NUMBER,
+        twiml: conferenceTwiml,
+      }),
+      client.calls.create({
+        to: resolvedReceiver,
+        from: TWILIO_PHONE_NUMBER,
+        twiml: conferenceTwiml,
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      message: 'Calling both users...',
+      roomId: resolvedRoomId,
+    });
+  } catch (err) {
+    console.error('Twilio start call failed:', err);
+    return res.status(500).json({
+      success: false,
+      error: err?.code === 21219
+        ? 'Twilio trial accounts can only call verified numbers. Verify both numbers or upgrade the account.'
+        : err?.code === 21608
+          ? 'Twilio trial accounts can only send SMS to verified numbers.'
+          : err.message,
+    });
+  }
+});
+
+// Fetch the latest Twilio call status, optionally filtered by phone number.
+app.get('/api/call-status', async (req, res) => {
+  try {
+    const { phone, limit = '5' } = req.query;
+    const {
+      TWILIO_ACCOUNT_SID,
+      TWILIO_AUTH_TOKEN,
+    } = process.env;
+
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN) {
+      return res.status(500).json({
+        success: false,
+        error: 'Twilio credentials are not configured',
+      });
+    }
+
+    const parsedLimit = Math.min(Math.max(parseInt(limit, 10) || 5, 1), 20);
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    const calls = await client.calls.list({ limit: parsedLimit });
+
+    const normalizedPhone = phone ? String(phone).trim() : '';
+    const filteredCalls = normalizedPhone
+      ? calls.filter((call) =>
+          String(call.to || '').includes(normalizedPhone) ||
+          String(call.from || '').includes(normalizedPhone)
+        )
+      : calls;
+
+    const latestCall = filteredCalls[0] || null;
+
+    return res.json({
+      success: true,
+      count: filteredCalls.length,
+      latest: latestCall
+        ? {
+            sid: latestCall.sid,
+            status: latestCall.status,
+            from: latestCall.from,
+            to: latestCall.to,
+            direction: latestCall.direction,
+            duration: latestCall.duration,
+            startTime: latestCall.startTime,
+            endTime: latestCall.endTime,
+            price: latestCall.price,
+            priceUnit: latestCall.priceUnit,
+            errorCode: latestCall.errorCode,
+            errorMessage: latestCall.errorMessage,
+          }
+        : null,
+      calls: filteredCalls.map((call) => ({
+        sid: call.sid,
+        status: call.status,
+        from: call.from,
+        to: call.to,
+        direction: call.direction,
+        duration: call.duration,
+        startTime: call.startTime,
+        endTime: call.endTime,
+        price: call.price,
+        priceUnit: call.priceUnit,
+        errorCode: call.errorCode,
+        errorMessage: call.errorMessage,
+      })),
+    });
+  } catch (err) {
+    console.error('Twilio call status fetch failed:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
+});
+
+// TwiML endpoint used by Twilio when each outbound call is answered.
+app.post('/twilio/conference', (req, res) => {
+  const room = req.query.room || 'demo';
+
+  res.type('text/xml');
+  res.send(buildConferenceTwiml(room));
+});
+
+// Health check
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'OK', message: 'qralertgo API is running' });
+});
+
+// WebRTC TURN/STUN credentials for app-to-app voice calls.
+app.get('/api/turn-credentials', (req, res) => {
+  const iceServers = [
+    { urls: 'stun:stun.l.google.com:19302' },
+    { urls: 'stun:stun1.l.google.com:19302' },
+  ];
+
+  const turnUrl = process.env.TURN_URL;
+  const turnUsername = process.env.TURN_USERNAME;
+  const turnPassword = process.env.TURN_PASSWORD;
+
+  if (turnUrl) {
+    iceServers.push({
+      urls: turnUrl,
+      username: turnUsername || undefined,
+      credential: turnPassword || undefined,
+    });
+  }
+
+  res.json({
+    ice_servers: iceServers.filter(Boolean),
+    ttl: 1800,
+    configured: !!turnUrl,
+  });
+});
+
+// Error handler
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ error: 'Something went wrong!' });
+});
+
+// 404
+app.use('*', (req, res) => {
+  res.status(404).json({ error: 'Route not found' });
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running → http://localhost:${PORT}`);
+  console.log(`Server accessible → http://10.26.246.153:${PORT}`);
+});

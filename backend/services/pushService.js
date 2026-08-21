@@ -1,0 +1,581 @@
+const { applicationDefault, cert, getApp, getApps, initializeApp } = require('firebase-admin/app');
+const { getMessaging } = require('firebase-admin/messaging');
+const https = require('https');
+const { pool } = require('../config/database');
+
+let fcmTokenColumnChecked = false;
+let firebaseWarningLogged = false;
+
+const normalizePushToken = (token) => (typeof token === 'string' ? token.trim() : '');
+
+const parseServiceAccount = () => {
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    try {
+      return JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    } catch (error) {
+      console.error('FIREBASE_SERVICE_ACCOUNT_JSON is not valid JSON:', error.message);
+      return null;
+    }
+  }
+
+  const projectId = process.env.FIREBASE_PROJECT_ID;
+  const clientEmail = process.env.FIREBASE_CLIENT_EMAIL;
+  const privateKey =
+    process.env.FIREBASE_PRIVATE_KEY_BASE64
+      ? Buffer.from(process.env.FIREBASE_PRIVATE_KEY_BASE64, 'base64').toString('utf8')
+      : process.env.FIREBASE_PRIVATE_KEY?.replace(/\\\n/g, '\n').replace(/\\n/g, '\n');
+
+  if (projectId && clientEmail && privateKey) {
+    return {
+      project_id: projectId,
+      client_email: clientEmail,
+      private_key: privateKey,
+    };
+  }
+
+  return null;
+};
+
+// Returns the Firebase app, or null when no credentials are configured.
+// The backend must keep running even if Firebase is not configured.
+const getFirebaseApp = () => {
+  if (getApps().length > 0) return getApp();
+
+  const serviceAccount = parseServiceAccount();
+  if (serviceAccount) {
+    return initializeApp({
+      credential: cert(serviceAccount),
+      projectId: serviceAccount.project_id || process.env.FIREBASE_PROJECT_ID,
+    });
+  }
+
+  // Application Default Credentials are only usable on hosts that expose them
+  // (e.g. GCP). On plain VPS servers this throws "Unable to detect a Project
+  // Id in the current environment", so only attempt it when explicitly set.
+  if (process.env.GOOGLE_APPLICATION_CREDENTIALS) {
+    return initializeApp({
+      credential: applicationDefault(),
+      projectId: process.env.FIREBASE_PROJECT_ID,
+    });
+  }
+
+  if (!firebaseWarningLogged) {
+    firebaseWarningLogged = true;
+    console.warn(
+      'Firebase FCM is not configured: set FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL ' +
+      'and FIREBASE_PRIVATE_KEY_BASE64 (or FIREBASE_SERVICE_ACCOUNT_JSON) in the server .env file. ' +
+      'Direct FCM sends are disabled, but Expo push tokens (registered by the app) still deliver ' +
+      'via Expo\'s push service; SMS/email fallbacks still work.'
+    );
+  }
+  return null;
+};
+
+const ensureFcmTokenColumn = async () => {
+  if (fcmTokenColumnChecked) return;
+
+  const [columns] = await pool.execute(
+    `SELECT COLUMN_NAME
+       FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_SCHEMA = DATABASE()
+        AND TABLE_NAME = 'users'
+        AND COLUMN_NAME IN ('fcm_token', 'expo_push_token')`
+  );
+  const columnMap = new Map(columns.map((column) => [column.COLUMN_NAME, true]));
+
+  if (!columnMap.has('fcm_token')) {
+    await pool.execute(
+      'ALTER TABLE users ADD COLUMN fcm_token TEXT NULL AFTER can_hide_number'
+    );
+    await pool.execute(
+      'CREATE INDEX idx_fcm_token ON users (fcm_token(191))'
+    ).catch(() => {});
+  }
+
+  if (!columnMap.has('expo_push_token')) {
+    await pool.execute(
+      'ALTER TABLE users ADD COLUMN expo_push_token TEXT NULL AFTER fcm_token'
+    );
+  }
+
+  fcmTokenColumnChecked = true;
+};
+
+const saveUserPushToken = async (userId, token, expoToken = null) => {
+  await ensureFcmTokenColumn();
+  const fcmToken = normalizePushToken(token);
+  const expoPushToken = normalizePushToken(expoToken);
+
+  if (!fcmToken && !expoPushToken) {
+    throw new Error('FCM token is required');
+  }
+
+  const updates = ['fcm_token = ?'];
+  const values = [fcmToken || null];
+  if (expoPushToken) {
+    updates.push('expo_push_token = ?');
+    values.push(expoPushToken);
+  }
+  values.push(userId);
+
+  await pool.execute(
+    `UPDATE users SET ${updates.join(', ')} WHERE id = ?`,
+    values
+  );
+
+  return fcmToken || expoPushToken;
+};
+
+// Returns both push tokens available for a user: the native FCM token
+// (delivered by direct Firebase admin send) and the Expo push token
+// (delivered through Expo's push service). Callers should try `fcmToken`
+// first, then fall back to `expoToken`.
+const getUserPushTokens = async (userId) => {
+  await ensureFcmTokenColumn();
+  const [rows] = await pool.execute(
+    'SELECT fcm_token, expo_push_token FROM users WHERE id = ?',
+    [userId]
+  );
+
+  const row = rows[0];
+  if (!row) return null;
+
+  const fcmToken = normalizePushToken(row.fcm_token);
+  const expoPushToken = normalizePushToken(row.expo_push_token);
+
+  return {
+    fcmToken: fcmToken || null,
+    expoToken: expoPushToken || null,
+    hasAny: !!(fcmToken || expoPushToken),
+  };
+};
+
+// Legacy single-token accessor (FCM preferred) kept for compatibility.
+const getUserPushToken = async (userId) => {
+  const tokens = await getUserPushTokens(userId);
+  if (!tokens) return null;
+  return tokens.fcmToken || tokens.expoToken || null;
+};
+
+// Dead-token errors: the device no longer accepts messages for this token.
+const isDeadPushTokenError = (reason) =>
+  typeof reason === 'string' &&
+  /not-registered|mismatched-credential|sender-id-mismatch|invalid-credentials|unregistered|token.*invalid|invalid.*token/i.test(
+    reason
+  );
+
+// Tries direct FCM first, then Expo push, so a failure in one channel does
+// not block delivery through the other. Dead tokens are cleared from the
+// database so later attempts fall through to the remaining channel (or SMS).
+const pushWithFallback = async ({ userId, fcmToken, expoToken, send, args = {} }) => {
+  const attempts = [];
+
+  if (fcmToken) {
+    const result = await send({ fcmToken, ...args });
+    attempts.push(result);
+    if (result.sent) return { ...result, channel: 'fcm', usedToken: fcmToken };
+    if (isDeadPushTokenError(result.reason) && userId) {
+      await pool.execute('UPDATE users SET fcm_token = NULL WHERE id = ?', [userId]).catch(() => {});
+    }
+  }
+
+  if (expoToken) {
+    const result = await send({ fcmToken: expoToken, ...args });
+    attempts.push(result);
+    if (result.sent) return { ...result, channel: 'expo', usedToken: expoToken };
+    if (isDeadPushTokenError(result.reason) && userId) {
+      await pool.execute('UPDATE users SET expo_push_token = NULL WHERE id = ?', [userId]).catch(() => {});
+    }
+  }
+
+  const reasons = attempts.map((attempt) => attempt.reason).filter(Boolean);
+  return {
+    sent: false,
+    channel: null,
+    usedToken: null,
+    reason: reasons.join('; ') || 'No push token registered',
+  };
+};
+
+const clearUserPushToken = async (userId) => {
+  await ensureFcmTokenColumn();
+  await pool.execute(
+    'UPDATE users SET fcm_token = NULL, expo_push_token = NULL WHERE id = ?',
+    [userId]
+  );
+};
+
+// Builds an FCM v1 message.
+// `dataOnly: true` (default for ring/alert/reminder pushes) produces a
+// DATA-only message. The Android app's custom VehicleFirebaseMessagingService
+// reads the data payload and starts the looping ringtone foreground service +
+// full-screen notification. Without data-only, Android routes `notification`
+// messages to the system tray while the app is closed and never calls
+// onMessageReceived, so the caller/alert would silently stop ringing.
+const buildFcmMessage = ({ fcmToken, title, body, data = {}, channelId, tag, ongoing, actions, dataOnly }) => {
+  const stringData = Object.fromEntries(
+    Object.entries({
+      title,
+      body,
+      message: body,
+      channel_id: channelId,
+      ...data,
+    }).map(([key, value]) => [key, value == null ? '' : String(value)])
+  );
+
+  if (dataOnly) {
+    return {
+      token: fcmToken,
+      data: stringData,
+      android: {
+        priority: 'high',
+        ttl: 864000,
+        collapseKey: tag ? String(tag).slice(0, 64) : undefined,
+      },
+      apns: {
+        headers: {
+          'apns-priority': '10',
+          'apns-expiration': '864000',
+        },
+        payload: {
+          aps: {
+            'content-available': 1,
+            'thread-id': tag ? String(tag).slice(0, 64) : undefined,
+          },
+        },
+      },
+    };
+  }
+
+  return {
+    token: fcmToken,
+    notification: { title, body },
+    data: stringData,
+    android: {
+      priority: 'high',
+      ttl: 864000,
+      notification: {
+        channelId: channelId || 'default',
+        priority: 'max',
+        sound: 'ringtone',
+        defaultSound: false,
+        visibility: 'public',
+        notificationCount: 1,
+        sticky: true,
+        ...(tag ? { tag: String(tag).slice(0, 64) } : {}),
+        ...(ongoing ? { ongoing: true } : {}),
+        ...(Array.isArray(actions) && actions.length > 0 ? { actions: actions.map(a => ({ title: a.title, icon: a.icon || 'ic_stop' })) } : {}),
+      },
+    },
+    apns: {
+      headers: {
+        'apns-priority': '10',
+        'apns-expiration': '864000',
+      },
+      payload: {
+        aps: {
+          alert: { title, body },
+          sound: 'ringtone.caf',
+          contentAvailable: true,
+          mutableContent: true,
+          category: channelId === 'incoming-calls' ? 'incoming_call' : 'incoming_alert',
+        },
+      },
+    },
+  };
+};
+
+const EXPO_PUSH_ENDPOINT = 'https://exp.host/--/api/v2/push/send';
+
+// Expo push tokens look like `ExponentPushToken[...]`.
+const isExpoToken = (token) => normalizePushToken(token).startsWith('ExponentPushToken[');
+
+// Sends through Expo's push service. No server-side Firebase credentials are
+// needed — the token identifies the app+device via the Expo project. Data-only
+// messages (no `title`/`body` fields) reach Android's custom
+// VehicleFirebaseMessagingService even while the app is closed, which starts
+// the looping ringtone foreground service + full-screen intent.
+const sendExpoPushMessage = async ({ token, title, body, data = {}, channelId, tag, dataOnly }) => {
+  const expoToken = normalizePushToken(token);
+  if (!expoToken) return { sent: false, reason: 'Missing push token' };
+
+  const stringData = Object.fromEntries(
+    Object.entries({
+      title,
+      body,
+      message: body,
+      channel_id: channelId,
+      ...data,
+    }).map(([key, value]) => [key, value == null ? '' : String(value)])
+  );
+
+  const message = {
+    to: expoToken,
+    ...(dataOnly ? {} : { title, body }),
+    data: stringData,
+    sound: 'ringtone',
+    channelId: channelId || 'default',
+    priority: 'high',
+    ttl: 864000,
+    contentAvailable: true,
+    ...(tag ? { tag: String(tag).slice(0, 64) } : {}),
+  };
+
+  try {
+    const body = JSON.stringify([message]);
+
+    const response = await new Promise((resolve, reject) => {
+      const req = https.request(
+        EXPO_PUSH_ENDPOINT,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+          },
+          timeout: 10000,
+        },
+        (res) => {
+          let raw = '';
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => { raw += chunk; });
+          res.on('end', () => resolve({ statusCode: res.statusCode, raw }));
+        }
+      );
+      req.on('error', reject);
+      req.on('timeout', () => req.destroy(new Error('Expo push request timed out')));
+      req.write(body);
+      req.end();
+    });
+
+    let payload;
+    try {
+      payload = JSON.parse(response.raw);
+    } catch {
+      payload = {};
+    }
+
+    const receipt = payload?.data?.[0] || {};
+    const ok = response.statusCode >= 200 && response.statusCode < 300 && receipt?.status === 'ok';
+
+    if (!ok) {
+      console.error('Expo push failed:', response.statusCode, response.raw.slice(0, 500));
+      return { sent: false, reason: receipt?.details?.error || `Expo push HTTP ${response.statusCode}` };
+    }
+
+    return { sent: true, messageId: receipt.id };
+  } catch (error) {
+    console.error('Expo push send error:', error);
+    return { sent: false, reason: error.message };
+  }
+};
+
+const sendFcmMessage = async ({ token, title, body, data = {}, channelId, tag, ongoing, actions, dataOnly = false }) => {
+  const fcmToken = normalizePushToken(token);
+  if (!fcmToken) {
+    return { sent: false, reason: 'Missing FCM token' };
+  }
+
+  // Expo tokens route through Expo's push service (no Firebase server key).
+  if (isExpoToken(fcmToken)) {
+    return sendExpoPushMessage({ token: fcmToken, title, body, data, channelId, tag, dataOnly });
+  }
+
+  let app;
+  try {
+    app = getFirebaseApp();
+  } catch (error) {
+    if (!firebaseWarningLogged) {
+      firebaseWarningLogged = true;
+      console.warn('Firebase FCM is not configured:', error.message);
+    }
+    return { sent: false, reason: 'Firebase FCM is not configured: ' + error.message };
+  }
+
+  if (!app) {
+    return { sent: false, reason: 'Firebase FCM is not configured' };
+  }
+
+  try {
+    const message = buildFcmMessage({
+      fcmToken,
+      title,
+      body,
+      data,
+      channelId,
+      tag,
+      actions,
+      dataOnly,
+    });
+
+    const messageId = await getMessaging(app).send(message);
+
+    return { sent: true, messageId };
+  } catch (error) {
+    console.error('FCM send failed:', error);
+    return { sent: false, reason: error.message };
+  }
+};
+
+const sendIncomingCallPush = async ({
+  fcmToken,
+  callerName,
+  qrCodeId,
+  callId,
+  scannerSocketId,
+  scannerUserId,
+  ownerUserId,
+  isReminder = false,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Incoming app call',
+    body: `${callerName || 'Someone'} is calling about your vehicle.`,
+    channelId: 'incoming-calls',
+    tag: callId,
+    ongoing: true,
+    actions: [{ title: 'Stop' }],
+    dataOnly: true,
+    data: {
+      type: 'incoming_call',
+      call_id: callId,
+      qr_code_id: qrCodeId,
+      caller_socket_id: scannerSocketId || '',
+      caller_user_id: scannerUserId || '',
+      scanner_socket_id: scannerSocketId || '',
+      scanner_user_id: scannerUserId || '',
+      owner_user_id: ownerUserId || '',
+      caller_name: callerName || 'Someone',
+      sent_at: new Date().toISOString(),
+      timeout_ms: process.env.INCOMING_RING_TIMEOUT_MS || process.env.MISSED_CALL_TIMEOUT_MS || 300000,
+      is_reminder: isReminder ? 'true' : '',
+    },
+  });
+
+const sendMissedCallPush = async ({
+  fcmToken,
+  callerName,
+  qrCodeId,
+  callId,
+  scannerUserId,
+  ownerUserId,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Missed app call',
+    body: `You missed a vehicle call from ${callerName || 'someone'}.`,
+    channelId: 'missed-calls',
+    dataOnly: true,
+    data: {
+      type: 'missed_call',
+      call_id: callId,
+      qr_code_id: qrCodeId,
+      scanner_user_id: scannerUserId || '',
+      owner_user_id: ownerUserId || '',
+      caller_name: callerName || 'Someone',
+    },
+  });
+
+const sendIncomingAlertPush = async ({
+  fcmToken,
+  qrCodeId,
+  requestId,
+  scannerSocketId,
+  scannerUserId,
+  scannerPhone,
+  message,
+  isReminder = false,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Vehicle alert',
+    body: message || 'Someone is trying to contact you about your vehicle.',
+    channelId: 'vehicle-alerts',
+    tag: requestId,
+    ongoing: true,
+    actions: [{ title: 'Stop' }],
+    dataOnly: true,
+    data: {
+      type: 'incoming_alert',
+      request_id: requestId,
+      qr_code_id: qrCodeId,
+      scanner_socket_id: scannerSocketId || '',
+      scanner_user_id: scannerUserId || '',
+      scanner_phone: scannerPhone || '',
+      message: message || 'Someone is trying to contact you about your vehicle.',
+      sent_at: new Date().toISOString(),
+      timeout_ms: process.env.INCOMING_RING_TIMEOUT_MS || 300000,
+      is_reminder: isReminder ? 'true' : '',
+    },
+  });
+
+const sendCancelCallPush = async ({
+  fcmToken,
+  callId,
+  ownerUserId,
+}) =>
+  sendFcmMessage({
+    token: fcmToken,
+    title: 'Call cancelled',
+    body: 'The caller cancelled the call request.',
+    channelId: 'missed-calls',
+    dataOnly: true,
+    data: {
+      type: 'cancel_call',
+      call_id: callId || '',
+      owner_user_id: ownerUserId || '',
+    },
+  });
+
+const reminderIntervals = new Map();
+
+const scheduleCallReminders = ({ callId, fcmToken, callerName, qrCodeId, scannerSocketId, scannerUserId, ownerUserId, requestId, scannerPhone, message, type = 'call' }) => {
+  const key = callId || requestId;
+  if (!key || !fcmToken) return;
+
+  const intervalMs = Number(process.env.INCOMING_RING_REMINDER_MS) || 30000;
+  const maxDurationMs = Number(process.env.INCOMING_RING_TIMEOUT_MS) || 300000;
+  let elapsed = 0;
+
+  const interval = setInterval(async () => {
+    elapsed += intervalMs;
+    if (elapsed >= maxDurationMs) {
+      clearInterval(interval);
+      reminderIntervals.delete(key);
+      return;
+    }
+
+    if (type === 'alert') {
+      await sendIncomingAlertPush({ fcmToken, qrCodeId, requestId, scannerSocketId, scannerUserId, scannerPhone, message, isReminder: true });
+    } else {
+      await sendIncomingCallPush({ fcmToken, callerName, qrCodeId, callId, scannerSocketId, scannerUserId, ownerUserId, isReminder: true });
+    }
+  }, intervalMs);
+
+  reminderIntervals.set(key, interval);
+};
+
+const stopCallReminders = (key) => {
+  const interval = reminderIntervals.get(key);
+  if (interval) {
+    clearInterval(interval);
+    reminderIntervals.delete(key);
+  }
+};
+
+module.exports = {
+  ensureFcmTokenColumn,
+  getFirebaseApp,
+  saveUserPushToken,
+  getUserPushToken,
+  getUserPushTokens,
+  pushWithFallback,
+  clearUserPushToken,
+  sendFcmMessage,
+  sendIncomingCallPush,
+  sendIncomingAlertPush,
+  sendMissedCallPush,
+  sendCancelCallPush,
+  scheduleCallReminders,
+  stopCallReminders,
+};

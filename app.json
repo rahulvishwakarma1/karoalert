@@ -1,0 +1,115 @@
+{
+  "expo": {
+    "name": "Karo Alert",
+    "slug": "qralertgo",
+    "scheme": "qralertgo",
+    "version": "1.0.3",
+    "sdkVersion": "55.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bitcode": false,
+      "infoPlist": {
+        "NSCameraUsageDescription": "KaroAlert uses the camera to scan QR codes.",
+        "NSMicrophoneUsageDescription": "KaroAlert uses the microphone for voice calls.",
+        "NSPhotoLibraryAddUsageDescription": "KaroAlert saves QR cards to your photo library."
+      }
+    },
+    "android": {
+      "package": "com.karoalert.app",
+      "versionCode": 10,
+      "googleServicesFile": "./google-services.json",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#ffffff"
+      },
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.VIBRATE",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.USE_FULL_SCREEN_INTENT",
+        "android.permission.WAKE_LOCK",
+        "android.permission.FOREGROUND_SERVICE",
+        "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.INTERNET",
+        "android.permission.SYSTEM_ALERT_WINDOW",
+        "android.permission.BLUETOOTH",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.WRITE_EXTERNAL_STORAGE"
+      ],
+      "blockedPermissions": [
+        "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_AUDIO",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED"
+      ],
+      "intentFilters": []
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "KaroAlert uses the camera to scan vehicle QR codes.",
+          "microphonePermission": "KaroAlert uses the microphone for voice calls."
+        }
+      ],
+      "expo-audio",
+      "expo-notifications",
+      "expo-asset",
+      [
+        "expo-media-library",
+        {
+          "savePhotosPermission": "Allow KaroAlert to save QR cards to your gallery.",
+          "granularPermissions": []
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": false
+        }
+      ],
+      [
+"expo-build-properties",
+            {
+              "android": {
+                "usesCleartextTraffic": true,
+                "enableProguardInReleaseBuilds": false,
+                "foregroundServiceTypes": [
+                  "mediaPlayback"
+                ]
+              }
+            }
+      ],
+      [
+        "@config-plugins/react-native-webrtc",
+        {
+          "cameraPermission": "KaroAlert uses camera for QR scanning.",
+          "microphonePermission": "KaroAlert uses microphone for voice calls."
+        }
+      ],
+      "@react-native-firebase/app",
+      "@react-native-firebase/auth",
+      "expo-sharing"
+    ],
+    "owner": "rahul777100",
+    "extra": {
+      "eas": {
+        "projectId": "271a3968-664a-4bf8-b88e-cdc439a82b8c"
+      }
+    }
+  }
+}

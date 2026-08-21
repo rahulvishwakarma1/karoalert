@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "184501143358",
+    "project_id": "karoalert-60316",
+    "storage_bucket": "karoalert-60316.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:184501143358:android:4d3e4a701c99a2fe058e6f",
+        "android_client_info": {
+          "package_name": "com.karoalert.app"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCcqpN4TzoKUb3-weO5GkAkNNBXIg9uCq0"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
